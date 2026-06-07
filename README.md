@@ -40,11 +40,14 @@ babysitting one prompt at a time.
 Requires [`uv`](https://docs.astral.sh/uv/) and the `claude` CLI on your `PATH`.
 
 ```sh
-uv tool install --from 'git+https://github.com/hglattergotz/odin@v0.2.1' odin
+uv tool install --from 'git+https://github.com/hglattergotz/odin@stable' odin
 odin --version
 ```
 
-Upgrade by installing a newer tag (e.g. a later `@vX.Y.Z`); see [CHANGELOG.md](CHANGELOG.md).
+The `stable` branch always points at the latest release, so that command keeps
+working. Upgrade later with `uv tool upgrade odin` (or re-run the install with
+`--reinstall`). To pin an exact version instead, use `@vX.Y.Z` in place of
+`@stable`; see [CHANGELOG.md](CHANGELOG.md).
 
 ## Quickest start — let your agent set it up
 
