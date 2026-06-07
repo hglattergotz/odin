@@ -1,0 +1,48 @@
+[project]
+name = "odin"
+version = "0.2.2"
+description = "Headless Claude Code task orchestrator"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Henning Glatter-Gotz", email = "henning@glatter-gotz.com" }
+]
+requires-python = ">=3.11"
+dependencies = []
+keywords = ["claude", "claude-code", "llm", "agent", "orchestration", "cli", "automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/hglattergotz/odin"
+Repository = "https://github.com/hglattergotz/odin"
+Issues = "https://github.com/hglattergotz/odin/issues"
+Changelog = "https://github.com/hglattergotz/odin/blob/main/CHANGELOG.md"
+
+[project.scripts]
+odin = "odin.cli:_entry"
+
+[build-system]
+requires = ["uv_build>=0.11.16,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest==8.3.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.uv]
+# Supply chain control: refuse to resolve packages published after this date.
+# Bump only when intentionally pulling in newer releases — always keep the
+# date at least 14 days in the past (see CLAUDE.md "Supply chain rules").
+exclude-newer = "2026-05-11T00:00:00Z"
