@@ -29,8 +29,6 @@ with `uv tool install --from 'git+https://github.com/hglattergotz/odin@vX.Y.Z' o
   `odin 0.2.1 (from .../site-packages/odin)`), to tell the global install
   apart from a `uv run` / source checkout; added `-V` as a short alias.
 
-[0.2.1]: https://github.com/hglattergotz/odin/releases/tag/v0.2.1
-
 ## [0.2.0] — 2026-06-06
 
 ### Added
@@ -51,8 +49,6 @@ with `uv tool install --from 'git+https://github.com/hglattergotz/odin@vX.Y.Z' o
 ### Changed
 - `queue/` run-state is no longer tracked in git (gitignored).
 
-[0.2.0]: https://github.com/hglattergotz/odin/releases/tag/v0.2.0
-
 ## [0.1.0] — 2026-06-06
 
 First tagged release.
@@ -69,5 +65,3 @@ First tagged release.
 - `odin resume` for the unattended held-task flow.
 - Central JSONL run/task metrics and `odin metrics` (text or `--html` report).
 - `odin guide` self-contained authoring manual; `odin demo` end-to-end fixture.
-
-[0.1.0]: https://github.com/hglattergotz/odin/releases/tag/v0.1.0
