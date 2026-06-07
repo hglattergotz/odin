@@ -2,6 +2,10 @@
 
 > Headless [Claude Code](https://code.claude.com/docs) task orchestrator — runs a queue of tasks through `claude -p`, one at a time, each in a fresh session.
 
+<p align="center">
+  <img src="assets/odin-diagram.webp" alt="How Odin works: an AI agent reads the guide and authors a task queue; Odin runs one task at a time in a fresh Claude session, carrying context forward; each task either completes and moves to the next, needs input (you answer, it resumes), or fails — until the queue is complete." width="840">
+</p>
+
 Odin feeds a queue of task files into Claude Code running headless in a target
 project, **one task at a time, each in a fresh session**. It carries context
 forward between tasks, runs the whole batch on a single branch, and stops
