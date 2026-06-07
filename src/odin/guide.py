@@ -52,6 +52,12 @@ _QUEUE = """\
   line per batch (most-recently-active first); you run, branch, and archive each
   batch independently; and adding more work later means a fresh `queue/<name>/`
   rather than piling unrelated tasks onto one undifferentiated `pending/` list.
+- **Version control — suggest, don't change:** as Odin runs it creates state
+  dirs under `queue/` (`running/ done/ held/ failed/ carry/`) that churn the git
+  tree. Most projects add `queue/` to `.gitignore` and leave it untracked —
+  unless they want the task files kept in history, in which case track them.
+  **Surface this to the user as a suggestion and let them decide. Do NOT edit
+  `.gitignore` yourself without asking.**
 """
 
 _TASK_BODY = """\

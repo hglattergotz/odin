@@ -85,6 +85,11 @@ Odin shows the question right in your terminal — press Enter to take the
 recommendation or type an answer, and it continues. `odin status` shows where
 every queue stands. That's the whole loop.
 
+> **Tip — version control:** as it runs, Odin creates run-state dirs under
+> `queue/` (`running/`, `done/`, `held/`, `carry/`, …). Most projects add
+> `queue/` to `.gitignore` so that churn stays out of git — unless you *want* the
+> task files tracked in history, in which case keep it tracked.
+
 ## Live tab status
 
 While a run is in flight, Odin paints its own terminal tab so a long batch is
