@@ -16,6 +16,7 @@ No retry, no resume — fresh session per call by design.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -215,11 +216,12 @@ def _handle_event(
     if etype == "assistant":
         text = _assistant_text(event)
         if text:
-            # Blank line + cyan bullet frames the block; the prose is verbatim
-            # (no reflow — code blocks/quotes would be mangled). Bullet only on
-            # the first line of the message.
-            _safe_write(out, "\n" + style.bullet(style.GLYPH_BULLET, out) + " " + text)
-            if not text.endswith("\n"):
+            # Blank line + cyan bullet frames the block. Markdown emphasis is
+            # rendered and the <<<...>>> handoff fences are prettified for the
+            # terminal (cosmetic only — the protocol is parsed from `result`).
+            rendered = _render_agent_text(text, out)
+            _safe_write(out, "\n" + style.bullet(style.GLYPH_BULLET, out) + " " + rendered)
+            if not rendered.endswith("\n"):
                 _safe_write(out, "\n")
         for name, detail in _tool_calls(event, project_dir):
             line = "   " + style.tool(f"{style.GLYPH_ARROW} {name}", out)
@@ -267,6 +269,73 @@ def _assistant_text(event: dict) -> str:
             if text:
                 parts.append(text)
     return "".join(parts)
+
+
+# ----------------------------------------------------------------------
+# display-only prettifying of the agent's message text
+# ----------------------------------------------------------------------
+# The protocol sentinel is parsed from the terminal `result` event (see
+# protocol.parse); what we print here is purely cosmetic. So we render Markdown
+# emphasis as ANSI (or strip the markers when color is off) and show the
+# <<<...>>> handoff fences as a clean, labelled, indented block.
+
+_SENTINEL_LABEL = {
+    "NEXT_CONTEXT": "carry-forward to the next task",
+    "NEEDS_INPUT": "needs input",
+    "FOLLOW_UP": "follow-up work discovered",
+}
+_SENTINEL_GLYPH = {"NEXT_CONTEXT": "↪", "NEEDS_INPUT": style.GLYPH_HELD, "FOLLOW_UP": "+"}
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+_HEADING_RE = re.compile(r"^(\s*)#{1,6}\s+(.*)$")
+_SENTINEL_OPEN_RE = re.compile(r"^<<<(NEXT_CONTEXT|NEEDS_INPUT|FOLLOW_UP)>>>$")
+
+
+def _emphasize(line: str, out: TextIO) -> str:
+    """Inline Markdown for the terminal: `**x**` / `__x__` -> bold (the bare text
+    when color is off); `# Heading` -> bold with the leading `#`s dropped."""
+    m = _HEADING_RE.match(line)
+    if m:
+        return m.group(1) + style.paint(m.group(2), style.BOLD, out=out)
+    return _BOLD_RE.sub(
+        lambda mm: style.paint(mm.group(1) or mm.group(2), style.BOLD, out=out), line
+    )
+
+
+def _render_agent_text(text: str, out: TextIO) -> str:
+    """Prettify the agent's streamed message for display (cosmetic only).
+
+    Reformats the `<<<NEXT_CONTEXT>>> … <<<END>>>` handoff fences (and
+    NEEDS_INPUT / FOLLOW_UP) into a dim, labelled, indented block — dropping the
+    raw markers — and renders Markdown emphasis. Fenced code blocks pass through
+    untouched. The protocol itself is parsed from the `result` event, not this.
+    """
+    rendered: list[str] = []
+    in_code = in_sentinel = False
+    for line in text.split("\n"):
+        if line.lstrip().startswith("```"):
+            in_code = not in_code
+            rendered.append(line)
+            continue
+        if in_code:
+            rendered.append(line)
+            continue
+        m = _SENTINEL_OPEN_RE.match(line.strip())
+        if m:
+            kind = m.group(1)
+            rendered.append(
+                "  " + style.dim(f"{_SENTINEL_GLYPH.get(kind, '·')} "
+                                 f"{_SENTINEL_LABEL.get(kind, kind.lower())}:", out)
+            )
+            in_sentinel = True
+            continue
+        if line.strip() == "<<<END>>>":
+            in_sentinel = False
+            continue
+        if in_sentinel:
+            rendered.append("    " + style.dim(line, out))
+            continue
+        rendered.append(_emphasize(line, out))
+    return "\n".join(rendered)
 
 
 # Per-tool, the input key worth showing on the activity line.

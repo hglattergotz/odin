@@ -14,7 +14,9 @@ from pathlib import Path
 
 import pytest
 
-from odin.runner import _abbrev_path, _handle_event, _tool_detail, run_claude
+from odin.runner import (
+    _abbrev_path, _handle_event, _render_agent_text, _tool_detail, run_claude,
+)
 
 
 FAKE_SCRIPT = r"""#!/bin/sh
@@ -346,6 +348,28 @@ def test_handle_event_uses_ansi_on_tty():
         out,
     )
     assert "\033[" in out.getvalue()   # color emitted on a TTY sink
+
+
+def test_render_agent_text_strips_markdown_and_reformats_sentinel():
+    out = _Sink(tty=False)  # color off -> markers stripped, plain text
+    text = (
+        "Done.\n\n**What I built:**\n## Summary\n- a thing\n\n"
+        "<<<NEXT_CONTEXT>>>\nDo task 2 next.\n<<<END>>>"
+    )
+    r = _render_agent_text(text, out)
+    assert "**" not in r and "What I built:" in r            # bold markers gone, text kept
+    assert "Summary" in r and "## " not in r                 # heading hash dropped
+    assert "<<<NEXT_CONTEXT>>>" not in r and "<<<END>>>" not in r
+    assert "carry-forward to the next task" in r             # labelled handoff
+    assert "    Do task 2 next." in r                        # body indented
+    assert "\033" not in r                                   # no ANSI off-TTY
+
+
+def test_render_agent_text_keeps_code_fences_and_bolds_on_tty():
+    code = _render_agent_text("```\nx = 2 ** 3\n```", _Sink(tty=False))
+    assert "2 ** 3" in code                                  # code fence untouched
+    tty = _render_agent_text("**hi**", _Sink(tty=True))
+    assert "\033[1m" in tty and "**" not in tty              # bold -> ANSI on a TTY
 
 
 def test_missing_project_dir_raises(fake_claude: Path, tmp_path: Path):
