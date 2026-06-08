@@ -25,10 +25,26 @@ def test_no_marker_is_unparseable():
 
 
 def test_both_markers_is_unparseable():
-    text = "<<<NEXT_CONTEXT>>>x<<<END>>>\n<<<NEEDS_INPUT>>>y<<<END>>>"
+    text = "<<<NEXT_CONTEXT>>>\nx\n<<<END>>>\n<<<NEEDS_INPUT>>>\ny\n<<<END>>>"
     r = parse(text)
     assert r.outcome is Outcome.UNPARSEABLE
     assert "both" in r.body.lower()
+
+
+def test_inline_marker_mention_in_prose_does_not_block():
+    # Regression: an agent that emits a real NEXT_CONTEXT block but also quotes
+    # the OTHER sentinel inline in its prose (e.g. "No `<<<NEEDS_INPUT>>>` was
+    # needed") must NOT be treated as "both markers present". Only standalone
+    # marker lines count as emitted blocks.
+    text = (
+        "Done. No `<<<NEEDS_INPUT>>>` was needed; the location was unambiguous.\n"
+        "<<<NEXT_CONTEXT>>>\n"
+        "Real carry-forward content.\n"
+        "<<<END>>>\n"
+    )
+    r = parse(text)
+    assert r.outcome is Outcome.COMPLETED
+    assert r.body == "Real carry-forward content."
 
 
 def test_open_with_no_end_is_unparseable():
@@ -38,7 +54,7 @@ def test_open_with_no_end_is_unparseable():
 
 def test_end_before_open_is_unparseable():
     # END appears, but only before the open marker — not a valid pair.
-    r = parse("<<<END>>>\n<<<NEXT_CONTEXT>>>body")
+    r = parse("<<<END>>>\n<<<NEXT_CONTEXT>>>\nbody")
     assert r.outcome is Outcome.UNPARSEABLE
 
 

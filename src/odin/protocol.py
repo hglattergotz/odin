@@ -28,6 +28,24 @@ FOLLOW_UP_OPEN = "<<<FOLLOW_UP>>>"
 END_MARKER = "<<<END>>>"
 
 
+def _marker_re(marker: str) -> re.Pattern[str]:
+    """A marker counts only as a standalone line (optionally indented).
+
+    The contract requires each sentinel on its own line as the last thing the
+    agent outputs. Matching only standalone lines means an inline, back-ticked
+    mention in prose (e.g. quoting `<<<NEEDS_INPUT>>>` in a summary) is NOT
+    treated as an emitted block — which previously routed otherwise-complete
+    tasks to failed/ with "both markers present".
+    """
+    return re.compile(r"(?m)^[ \t]*" + re.escape(marker) + r"[ \t]*$")
+
+
+_NEXT_RE = _marker_re(NEXT_CONTEXT_OPEN)
+_NEEDS_RE = _marker_re(NEEDS_INPUT_OPEN)
+_FOLLOW_RE = _marker_re(FOLLOW_UP_OPEN)
+_END_RE = _marker_re(END_MARKER)
+
+
 class Outcome(str, Enum):
     COMPLETED = "completed"   # NEXT_CONTEXT block found
     HELD = "held"             # NEEDS_INPUT block found
@@ -42,21 +60,22 @@ class ParseResult:
     follow_up: str | None = None  # raw FOLLOW_UP body (COMPLETED only), if present
 
 
-def _block_body(text: str, open_marker: str) -> str | None:
+def _block_body(text: str, open_re: re.Pattern[str]) -> str | None:
     """Body of the LAST `open_marker … <<<END>>>` block, or None if absent.
 
-    Uses the last open marker (so quoting the protocol earlier doesn't win) and
-    the FIRST END after it (so it pairs with its own close even when other
+    Markers are matched only as standalone lines (see `_marker_re`). Uses the
+    last open marker (so quoting the protocol earlier doesn't win) and the FIRST
+    standalone END after it (so it pairs with its own close even when other
     blocks — e.g. FOLLOW_UP — follow). Returns "" for a present-but-empty block.
     """
-    open_idx = text.rfind(open_marker)
-    if open_idx == -1:
+    opens = list(open_re.finditer(text))
+    if not opens:
         return None
-    start = open_idx + len(open_marker)
-    end_idx = text.find(END_MARKER, start)
-    if end_idx == -1:
+    start = opens[-1].end()
+    end_match = _END_RE.search(text, start)
+    if end_match is None:
         return None
-    return text[start:end_idx].strip()
+    return text[start:end_match.start()].strip()
 
 
 def parse(text: str) -> ParseResult:
@@ -72,8 +91,8 @@ def parse(text: str) -> ParseResult:
     if text is None:
         return ParseResult(Outcome.UNPARSEABLE, "no output", "")
 
-    has_next = NEXT_CONTEXT_OPEN in text
-    has_held = NEEDS_INPUT_OPEN in text
+    has_next = _NEXT_RE.search(text) is not None
+    has_held = _NEEDS_RE.search(text) is not None
 
     if has_next and has_held:
         return ParseResult(
@@ -89,9 +108,10 @@ def parse(text: str) -> ParseResult:
         )
 
     open_marker = NEXT_CONTEXT_OPEN if has_next else NEEDS_INPUT_OPEN
+    open_re = _NEXT_RE if has_next else _NEEDS_RE
     outcome = Outcome.COMPLETED if has_next else Outcome.HELD
 
-    body = _block_body(text, open_marker)
+    body = _block_body(text, open_re)
     if body is None:
         return ParseResult(
             Outcome.UNPARSEABLE,
@@ -102,8 +122,8 @@ def parse(text: str) -> ParseResult:
         return ParseResult(Outcome.UNPARSEABLE, f"{open_marker} block is empty", text)
 
     follow_up = None
-    if outcome is Outcome.COMPLETED and FOLLOW_UP_OPEN in text:
-        follow_up = _block_body(text, FOLLOW_UP_OPEN) or None
+    if outcome is Outcome.COMPLETED and _FOLLOW_RE.search(text) is not None:
+        follow_up = _block_body(text, _FOLLOW_RE) or None
 
     return ParseResult(outcome, body, text, follow_up=follow_up)
 

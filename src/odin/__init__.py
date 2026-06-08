@@ -1,3 +1,8 @@
 """Odin — headless Claude Code task orchestrator."""
 
-__version__ = "0.2.3.dev0"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("odin")
+except PackageNotFoundError:  # not installed (e.g. running from a source tree)
+    __version__ = "0.0.0+unknown"
