@@ -1,9 +1,11 @@
 # Multi-platform agent backends for Odin
 
-**Status:** Proposal (branch `cursor`)  
+**Status:** Proposal (branch `cursor`, PR #1) — revised after round-1 review  
 **Goal:** Let Odin orchestrate tasks through multiple headless agent CLIs — starting with **Claude Code** (`claude`) and **Cursor Agent** (`agent`), with a path to **Kiro** and others — without degrading existing behaviour.
 
 This document is written to be split into an Odin task queue. It assumes you have read `CLAUDE.md` in this repo and understand how Odin works today.
+
+**Round-1 review:** A Claude-side reviewer verified repo-truth items against source; a Cursor-side pass ran the empirical verification checklist (Appendix C) against real `agent` output. Both are incorporated below.
 
 ---
 
@@ -24,13 +26,18 @@ Everything else (tests, commits, branching per task) lives in the **target proje
 
 | Area | File | Coupling |
 |------|------|----------|
-| Subprocess | `src/odin/runner.py` | `run_claude()`, hard-coded argv, Claude stream-json event shapes |
-| CLI | `src/odin/cli.py` | `--claude-bin`, `--permission-mode`, `--allowed-tools`, `--disallowed-tools`; calls `run_claude` directly |
-| Protocol injection | `src/odin/contract.py` | Assumes `--append-system-prompt` exists |
-| Metrics | `src/odin/metrics.py` | Normalises Claude token keys; records `claude_duration_ms`; expects `total_cost_usd` |
+| Subprocess loop | `src/odin/runner.py` | `run_claude()` hard-codes argv; reads prompt on stdin; drains stderr on a daemon thread; computes `succeeded` at `:174-179` |
+| argv / system-prompt flag | `src/odin/runner.py:87-88` | Passes `--append-system-prompt` when `system_prompt` is set (wired from `cli.py`) |
+| Protocol *text* | `src/odin/contract.py:16-17,21,24,107` | `_BASE` / `_BRANCH` **runtime strings** hard-code "this project's **CLAUDE.md**" — wrong for Cursor (`AGENTS.md`) |
+| CLI invoke site | `src/odin/cli.py:630` | Single call site to `run_claude`; dry-run hard-codes `"claude -p"` at `:621`; early-returns after first task at `:626` |
+| CLI flags | `src/odin/cli.py` | `--claude-bin`, `--permission-mode`, `--allowed-tools`, `--disallowed-tools`; **no `--model` today** |
+| Startup instruction warning | `src/odin/cli.py:313-318` | Always warns if `{project}/CLAUDE.md` missing — fires on AGENTS.md-only Cursor projects |
+| Git-workflow lint hook | `src/odin/cli.py:747-761` | `_warn_claude_md_conflicts` reads `project / "CLAUDE.md"` literally; no-ops silently for Cursor |
+| Metrics | `src/odin/metrics.py:207,244` | `claude_duration_ms`, `claude_api_ms` field names; run summary `cost_usd_total` sums only non-null task costs → **0.0** when all null |
 | Startup lint | `src/odin/lint.py` | Scans `CLAUDE.md` only |
-| Guide / docs | `src/odin/guide.py`, README | Claude-centric wording |
-| Success criteria | `runner._GOOD_STOPS` | Requires `stop_reason ∈ {end_turn, stop_sequence}` — **Cursor does not emit this** |
+| Guide / docs | `src/odin/guide.py:139`, README | Claude-centric wording; guide protocol section generated from `build_system_prompt(None)` |
+| Success criteria | `runner._GOOD_STOPS` (`runner.py:49`) | Requires `stop_reason ∈ {end_turn, stop_sequence}` — **Cursor does not emit `stop_reason`** |
+| Stale display strings | `runner.py:5-6,170` | Docstring lists `--max-turns` in baseline argv (stale vs `:82-86`); stderr banner reads `[claude stderr]` |
 
 The queue model, sentinel protocol, carry-context, held/resume flow, follow-ups, git startup, terminal signalling, and metrics *shape* are all platform-agnostic. Only the **agent backend** layer is Claude-specific.
 
@@ -38,48 +45,75 @@ The queue model, sentinel protocol, carry-context, held/resume flow, follow-ups,
 
 ## 2. Design principle: backends, not forks
 
-Introduce a small **AgentBackend** interface. Odin's loop stays the same; each platform implements:
+Introduce a small **AgentBackend** interface. Odin's task loop stays the same; each platform implements invoke-building, stream interpretation, and result normalisation.
+
+### Refactor scope (explicit)
+
+**Stays generic in `runner.py`:**
+
+- Subprocess exec (`Popen`), stdin write, concurrent stderr drain (daemon thread)
+- NDJSON line loop, wall-clock timing
+- Best-effort stream display dispatch to the active backend
+
+**Moves into per-platform backends:**
+
+- `build_invoke(...)` — argv + final prompt text (incl. prepend vs flag injection)
+- `handle_stream_event(event)` — live terminal rendering (tool lines differ)
+- `normalise_result(terminal_event, exit_code, wall_ms) -> RunResult` — token/cost/stop_reason/succeeded
+
+Do **not** move the whole subprocess loop into `ClaudeBackend`; only the platform-specific pieces.
+
+### Types
 
 ```python
 @dataclass(frozen=True)
 class AgentInvokeSpec:
-    argv: list[str]           # full command (binary + flags)
-    prompt: str               # bytes/text sent on stdin (or embedded — see below)
+    argv: list[str]           # binary + flags (not including prompt arg when using stdin)
+    prompt: str               # text sent on stdin
     cwd: Path
 
 @dataclass(frozen=True)
-class RunResult:              # already exists — keep as the universal outcome
+class RunResult:              # already exists — extend carefully (frozen dataclass)
     succeeded: bool
     final_text: str
     stop_reason: str | None
     error: str | None
     exit_code: int
     session_id: str | None
-    wall_ms: int
-    duration_ms: int | None
-    api_ms: int | None
-    num_turns: int | None
-    usage: dict | None
-    cost_usd: float | None
-    platform: str             # NEW: "claude" | "cursor" | ...
+    platform: str = "claude"  # NEW — must have a default (non-default after defaulted fields breaks dataclass)
+    wall_ms: int = 0
+    duration_ms: int | None = None
+    api_ms: int | None = None
+    num_turns: int | None = None
+    usage: dict | None = None
+    cost_usd: float | None = None
 ```
+
+`RunResult` is `@dataclass(frozen=True)` today (`runner.py:31`). Backends must **construct fresh** instances; never mutate.
+
+### Success gate placement
+
+Today `succeeded` is computed inside the runner (`runner.py:174-179`) *after* stream parsing. For Cursor, **`stop_reason` is absent on success**, so a naive gate would route every Cursor success to `failed/`.
+
+**Recommendation:** move success classification into `normalise_result` (or add `backend.classify_run(terminal_event, exit_code) -> bool`). The runner calls the backend and trusts `RunResult.succeeded`. Backends may still populate a synthetic `stop_reason` for metrics/debug, but **`succeeded` must not depend on faking `stop_reason` through the old gate**.
 
 Each backend provides:
 
 - **`build_invoke(prompt, project_dir, system_prompt, run_options) -> AgentInvokeSpec`**
-- **`parse_stream_line(event: dict) -> StreamUpdate | None`** (optional; can share a normaliser)
-- **`normalise_result(event: dict, exit_code, wall_ms) -> RunResult`**
+- **`handle_stream_event(event, out, project_dir) -> CapturedFields | None`**
+- **`normalise_result(terminal_event | None, exit_code, wall_ms, stderr) -> RunResult`**
 - **`default_binary() -> str`**
+- **`instruction_files() -> list[Path]`** — for startup warnings / lint
 
-Odin selects a backend from **`--platform`** (or config default). The existing Claude path becomes `ClaudeBackend`; Cursor becomes `CursorBackend`.
+Odin selects a backend from **`--platform`** (or config). The existing Claude path becomes `ClaudeBackend`; Cursor becomes `CursorBackend`.
 
-**Non-goals for v1:** session resume across tasks (both CLIs support `--resume`, but Odin's model is *fresh session per task* — keep that), cloud/SDK runtimes (local CLI only).
+**Non-goals for v1:** session resume across tasks (both CLIs support `--resume`; Odin keeps fresh session per task), cloud/SDK runtimes (local CLI only).
 
 ---
 
 ## 3. CLI surface
 
-### New flag (primary selector)
+### Platform selector
 
 ```
 odin run [QUEUE] --platform {claude,cursor} ...
@@ -92,29 +126,54 @@ Resolution order:
 3. `default_platform` in config (see §4)
 4. Fallback: `claude` (preserves today's behaviour)
 
+### Model selector (all platforms)
+
+Today Odin passes **no `--model`** to any CLI (verified: zero `model` handling in `src/odin/*.py`). Add a **platform-agnostic** flag:
+
+```
+odin run ... --model MODEL
+```
+
+Resolution order:
+
+1. `--model` on the command line
+2. `$ODIN_MODEL`
+3. `platforms.<platform>.model` in config
+4. Unset → platform CLI default (today's behaviour; no flag emitted)
+
+Maps to `claude --model …` and `agent --model …` when set.
+
 ### Platform-specific flags
 
-Keep Claude flags working unchanged when `--platform claude` (or default). Add Cursor equivalents; unknown flags for the active platform should warn and be ignored (or rejected — pick one, document it).
+Keep Claude flags working unchanged when `--platform claude` (or default). Add Cursor equivalents; warn when a flag is meaningless for the active platform.
 
-| Odin flag (today) | Claude mapping | Cursor mapping |
-|-------------------|----------------|----------------|
+| Odin flag | Claude mapping | Cursor mapping |
+|-----------|----------------|----------------|
 | `--claude-bin` | `claude` binary | *(ignored)* |
 | `--agent-bin` *(new)* | *(ignored)* | `agent` binary |
 | `--permission-mode` | `--permission-mode` | *(no direct equivalent)* |
-| `--allowed-tools` | `--allowed-tools` | *(no CLI flag — use `~/.cursor/cli-config.json` permissions)* |
+| `--allowed-tools` | `--allowed-tools` | *(no CLI flag — `~/.cursor/cli-config.json`)* |
 | `--disallowed-tools` | `--disallowed-tools` | *(same)* |
-| `--max-turns` | `--max-turns` | *(not exposed by Cursor CLI today — omit or no-op)* |
-| *(new)* `--model` | *(Claude picks via its own config)* | `--model` |
-| *(new)* `--force` | implied by `bypassPermissions` | `--force` / `--yolo` |
-| *(new)* `--trust` | N/A | `--trust` (required for headless) |
-| *(new)* `--sandbox` | N/A | `--sandbox enabled\|disabled` |
-| *(new)* `--approve-mcps` | N/A | `--approve-mcps` |
+| `--max-turns` | `--max-turns` | *(not exposed — no-op with warning)* |
+| `--model` | `--model` | `--model` |
+| `--force` | implied by `bypassPermissions` default | `--force` / `--yolo` |
+| `--trust` | N/A | `--trust` (recommended for headless) |
+| `--sandbox` | N/A | `--sandbox enabled\|disabled` |
+| `--approve-mcps` | N/A | `--approve-mcps` |
 
-Rename help text from "claude" to "agent" where generic; keep backward-compatible aliases.
+**Flag aliases (decision B4):** keep `--claude-bin` **forever** for backward compatibility. Add `--agent-bin` + `--platform`; do not deprecate in v1.
 
 ### Dry-run output
 
-Dry-run should print the **resolved backend name**, argv, and prompt length — not hard-code `claude -p`.
+Dry-run (`cli.py:621-626`) must:
+
+- Source argv from `backend.build_invoke(...)` — not hard-code `"claude -p"`
+- Print resolved **platform**, argv, and prompt length
+- Preserve today's behaviour: preview **one** task and return (early exit)
+
+### New subcommand: `odin config`
+
+Interactive config setter (see §4). Added to subcommand list: `{run,status,resume,demo,guide,archive,metrics,config}`.
 
 ---
 
@@ -122,38 +181,40 @@ Dry-run should print the **resolved backend name**, argv, and prompt length — 
 
 **Location:** `$ODIN_HOME/config.toml` (default `~/.odin/config.toml`). Override with `$ODIN_CONFIG`.
 
-Rationale: platform binaries, models, permission posture, and future Kiro settings differ per user/machine. CLI flags override config; config overrides baked-in defaults.
+**Read:** on every `odin run` (merge with CLI flags; flags win).
+
+**Write:** **only** via explicit `odin config` — never silent auto-scaffolding during `odin run`. This adds a second Odin write surface beside metrics; update Odin repo `CLAUDE.md` "one write" rule to enumerate (1) metrics telemetry and (2) user-initiated config writes.
+
+Rationale: platform binaries, models, permission posture, and future Kiro settings differ per user/machine. The owner does not want to hand-edit TOML.
 
 ### Example config
 
 ```toml
 # ~/.odin/config.toml
+# Written by `odin config` — hand-edited changes may be overwritten on next `odin config set`.
 
 default_platform = "claude"
 
 # ---------------------------------------------------------------------------
-# Claude Code (current behaviour)
+# Claude Code
 # ---------------------------------------------------------------------------
 [platforms.claude]
 binary = "claude"
 permission_mode = "bypassPermissions"
 output_format = "stream-json"
 verbose = true
-
-# Optional passthrough lists (same as CLI defaults when unset)
-# allowed_tools = ["Read", "Write", "Bash"]
-# disallowed_tools = ["WebFetch"]
+# model = "claude-sonnet-4-6"   # unset = claude CLI default (no --model passed)
 
 [platforms.claude.invoke]
-prompt_via = "stdin"                    # claude -p reads stdin
-system_prompt_via = "append_system_flag" # --append-system-prompt TEXT
+prompt_via = "stdin"
+system_prompt_via = "append_system_flag"   # --append-system-prompt TEXT
 
 [platforms.claude.metrics]
 usage_input = "input_tokens"
 usage_output = "output_tokens"
 usage_cache_read = "cache_read_input_tokens"
 usage_cache_write = "cache_creation_input_tokens"
-cost_field = "total_cost_usd"           # on terminal result event
+cost_field = "total_cost_usd"
 
 # ---------------------------------------------------------------------------
 # Cursor Agent CLI
@@ -161,40 +222,61 @@ cost_field = "total_cost_usd"           # on terminal result event
 [platforms.cursor]
 binary = "agent"
 output_format = "stream-json"
-force = true          # headless file edits (like bypassPermissions)
-trust = true          # skip workspace-trust prompt in -p mode
-approve_mcps = true   # unattended MCP approval
-sandbox = "disabled"  # match Claude's full shell access by default
-# model = "composer-2.5-fast"   # optional default; omit = account default
+force = true
+trust = true
+approve_mcps = true
+sandbox = "disabled"
+# model = "composer-2.5-fast"   # unset = account default
 
 [platforms.cursor.invoke]
-prompt_via = "stdin"           # `agent -p` reads stdin when no prompt arg
-system_prompt_via = "prepend"  # no --append-system-prompt; prepend to user prompt
+prompt_via = "stdin"
+system_prompt_via = "prepend"
 
 [platforms.cursor.metrics]
 usage_input = "inputTokens"
 usage_output = "outputTokens"
 usage_cache_read = "cacheReadTokens"
 usage_cache_write = "cacheWriteTokens"
-cost_field = ""                # empty = no cost from CLI; store null
+cost_field = ""                # empty = no cost field; store null
 
 # ---------------------------------------------------------------------------
-# Future: Kiro / Apple Foundation Models (placeholder shape)
+# Future: Kiro (placeholder)
 # ---------------------------------------------------------------------------
 # [platforms.kiro]
 # binary = "kiro"
-# ...
 ```
+
+### `odin config` command (interactive setter)
+
+**Motivation:** `/model`-style UX without editing TOML by hand.
+
+| Command | Behaviour |
+|---------|-----------|
+| `odin config` | Interactive menu (TTY): pick `default_platform`; per-platform settings (model, binary, autonomy posture) |
+| `odin config show` | Print effective config (merged with env hints) |
+| `odin config get KEY` | e.g. `platforms.claude.model` |
+| `odin config set KEY VALUE` | Non-interactive for CI/scripts, e.g. `odin config set platforms.claude.model claude-sonnet-4-6` |
+
+**Model picker UX:** curated list per platform + **"Other (type a value)"** + **"Use platform default (unset)"** — model IDs drift; free-text required.
+
+**Implementation constraints:**
+
+- Reuse stdlib interactive infra in `src/odin/prompts.py` (branch selector / held Q&A pattern); TTY-gated like resume.
+- **`tomllib` is read-only** (Python 3.11+) — implement a **minimal hand-rolled TOML writer** for the flat/small schema. **No new dependencies** (`tomli-w` forbidden per supply-chain rules).
+- Write **atomically** (`write temp → rename`).
+- Merge updates: don't clobber keys the command didn't touch. Document that round-tripping may drop user comments in the file.
+
+**First-run:** `odin config` may create `~/.odin/` and an empty/minimal config on first interactive use; no implicit creation during `odin run`.
 
 ### Project-level overrides (optional v2)
 
-`--project/.odin/config.toml` or `.odin.toml` merged over user config (project wins). Defer unless needed — user-level config is enough for v1.
+`--project/.odin/config.toml` merged over user config. Defer unless needed.
 
 ---
 
 ## 5. Cursor CLI: equivalent invocation
 
-Verified against local `agent` (CLI `2026.06.04-5fd875e`). Cursor's headless mode is **`agent -p`** (alias `--print`), not the `cursor` editor binary.
+Empirically verified on **`agent` CLI `2026.06.04-5fd875e`** (see Appendix C). Headless mode is **`agent -p`** (`--print`), not the `cursor` editor binary.
 
 ### Recommended argv (parity with today's Claude run)
 
@@ -211,36 +293,36 @@ agent \
   # prompt on stdin
 ```
 
-Working directory: set **`cwd`** and **`--workspace`** to `--project` so `AGENTS.md`, `.cursor/rules`, and git context load the same way as an interactive session in that folder.
+Set **`cwd`** and **`--workspace`** to `--project`. Verified: `AGENTS.md` is found with `--workspace` set; also works with cwd alone when stdin is piped from that directory (Appendix C.6).
 
-**Do not** pass `--continue` / `--resume` — Odin needs a **fresh session per task** (same rule as Claude).
+**Do not** pass `--continue` / `--resume` — fresh session per task.
 
 ### Prompt delivery
 
-Both CLIs accept **stdin** when no prompt arguments are given (verified for Cursor). Keep Odin's stdin-based prompt path; avoids shell-quoting bugs.
+Both CLIs accept **stdin** when no prompt arguments are given (verified). Keep Odin's stdin path.
 
 ### System / protocol injection
 
-Claude:
+Claude (`runner.py:87-88`):
 
 ```
 claude -p ... --append-system-prompt "<contract>"
 # stdin = task prompt (+ carry context)
 ```
 
-Cursor has **no** `--append-system-prompt`. Options:
+Cursor: **no `--append-system-prompt`** (verified: `agent -p --help | grep -i system` matches only `about … system` — Appendix C.7).
 
 | Approach | Pros | Cons |
 |----------|------|------|
-| **A. Prepend contract to prompt** *(recommended v1)* | No project file changes; works immediately; mirrors "system + user" | Slightly more input tokens; contract not in true system role |
-| B. Write `.odin-protocol.md` + "read this first" | Cleaner separation | Agent may skip; file churn |
-| C. Require protocol in `AGENTS.md` | Persistent | Drift vs `contract.py`; duplicates Claude's injection story |
+| **A. Prepend contract to prompt** *(v1)* | Works immediately; no project file changes | More input tokens; not true system role |
+| B. Sidecar file + "read first" | Cleaner separation | Agent may skip |
+| C. Require protocol in `AGENTS.md` | Persistent | Drift vs `contract.py` |
 
-**Recommendation:** Use **A** for v1 (`system_prompt_via = "prepend"`), with a clear delimiter:
+**Recommendation:** **A** with delimiters:
 
 ```markdown
 <!-- ODIN_PROTOCOL (injected; takes precedence for task termination and git policy) -->
-... contents of build_system_prompt(branch) ...
+... build_system_prompt(branch, instructions_name=...) ...
 <!-- END ODIN_PROTOCOL -->
 
 ## Context from previous task
@@ -249,27 +331,31 @@ Cursor has **no** `--append-system-prompt`. Options:
 (task body)
 ```
 
-Long-term, if Cursor adds a system-prompt flag, switch via config without changing the loop.
+### Protocol text must be platform-neutral (review A1)
+
+`contract.build_system_prompt()` must stop naming `CLAUDE.md` in injected runtime strings. Parameterise, e.g.:
+
+- `instructions_name="project instructions"` (generic), or
+- per-platform: `"CLAUDE.md"` / `"AGENTS.md"`
+
+Also affects `odin guide` output (`guide.py:139` calls `build_system_prompt(None)`).
 
 ### Autonomy / permissions parity
 
 | Intent | Claude | Cursor |
 |--------|--------|--------|
-| Full autonomy (Odin default) | `--permission-mode bypassPermissions` | `--force` + `--trust` + `sandbox=disabled` |
-| Restricted | `acceptEdits` / tool allowlists | `~/.cursor/cli-config.json` `permissions.allow/deny` + no `--force` |
-| MCP auto-approve | default in bypass mode | `--approve-mcps` |
+| Full autonomy (Odin default) | `--permission-mode bypassPermissions` | `--force` + `--trust` + `sandbox=disabled` + `--approve-mcps` |
+| Restricted | `acceptEdits` / tool allowlists | `~/.cursor/cli-config.json` + no `--force` |
 
-Document that Cursor tool allow/deny is **config-file driven**, not per-invocation flags like Claude.
+Appendix C.5: on the test system, `--force --trust` allowed file edits + shell without blocking in piped/non-TTY mode. **Still pass both by default** — behaviour may differ by Cursor version and account policy; a hung trust/MCP prompt blocks Odin forever (no timeout).
 
 ---
 
 ## 6. Stream-json compatibility
 
-Cursor and Claude both emit **NDJSON** with overlapping event types. Odin can reuse most of the loop; differences need normalisation.
+### Terminal `result` event
 
-### Terminal `result` event (what Odin parses)
-
-**Claude** (today):
+**Claude:**
 
 ```json
 {
@@ -277,8 +363,7 @@ Cursor and Claude both emit **NDJSON** with overlapping event types. Odin can re
   "subtype": "success",
   "stop_reason": "end_turn",
   "result": "...",
-  "session_id": "...",
-  "usage": { "input_tokens": 1, "output_tokens": 2, ... },
+  "usage": { "input_tokens": 1, "output_tokens": 2 },
   "total_cost_usd": 0.04,
   "duration_ms": 1234,
   "duration_api_ms": 1200,
@@ -286,196 +371,166 @@ Cursor and Claude both emit **NDJSON** with overlapping event types. Odin can re
 }
 ```
 
-**Cursor** (observed):
+**Cursor (verbatim, Appendix C.3):**
 
 ```json
 {
   "type": "result",
   "subtype": "success",
+  "duration_ms": 4993,
+  "duration_api_ms": 4993,
   "is_error": false,
-  "result": "...",
-  "session_id": "...",
+  "result": "pong",
+  "session_id": "7bfeef23-655d-4191-bdf4-61b9bdc0621f",
+  "request_id": "0cc5c6e7-6e8e-4035-851c-d888633106d8",
   "usage": {
-    "inputTokens": 10888,
-    "outputTokens": 31,
-    "cacheReadTokens": 5440,
+    "inputTokens": 10760,
+    "outputTokens": 46,
+    "cacheReadTokens": 448,
     "cacheWriteTokens": 0
-  },
-  "duration_ms": 1333,
-  "duration_api_ms": 1333,
-  "request_id": "..."
+  }
 }
 ```
 
-**Gaps:**
+**Confirmed absent on Cursor success:** `stop_reason`, `total_cost_usd`, `num_turns`.
+
+**Error paths (Appendix C.4):**
+
+- Invalid model: **exit 1**, error text on **stderr only**, **no** terminal `result` event → Odin treats as failure (same as Claude silence).
+- Tool/shell failures inside a run: may still end with `subtype: success`, `is_error: false`, exit 0 (e.g. `exit 42` shell command) — task outcome is still driven by **sentinel parse**, not subprocess/tool exit codes.
+
+### Field normalisation
 
 | Field | Claude | Cursor | Odin action |
 |-------|--------|--------|-------------|
-| `stop_reason` | present | **absent** | Synthesise `"end_turn"` when `subtype == success` && `is_error == false` |
-| `total_cost_usd` | present | **absent** | Store `null`; optional future: estimate from model + tokens |
-| `num_turns` | present | absent | Store `null` |
-| Token keys | snake_case | camelCase | Normalise in backend or extend `metrics._norm_usage` |
+| `stop_reason` | present | absent | Optional synthetic value for logs; **`succeeded` set by backend** |
+| `is_error` | usually present on failure | present on success | Treat **missing as not-an-error** (consistent with `runner.py:254`) |
+| `total_cost_usd` | present | absent | `cost_usd: null` |
+| Token keys | snake_case | camelCase | Map via config `usage_*` keys |
+| `thinking` events | N/A | emitted in stream | Ignore for display (Cursor docs: suppressed in some modes; observed in tests) |
 
-### Live display (stdout styling)
+### Live display
 
-| Event | Claude (today) | Cursor |
-|-------|----------------|--------|
-| Init | `system/init` + session | Same |
+| Event | Claude | Cursor |
+|-------|--------|--------|
+| Init | `system/init` | Same |
 | Assistant text | `assistant` + `message.content[].text` | Same |
-| Tool activity | `tool_use` blocks inside `assistant` | Separate `tool_call` events (`readToolCall`, `writeToolCall`, …) |
+| Tool activity | `tool_use` inside `assistant` | `tool_call` started/completed (`readToolCall`, `editToolCall`, `shellToolCall`, …) |
 
-Extend `_handle_event` (or add `CursorStreamRenderer`) to show Cursor tool lines:
-
-- `tool_call` + `subtype: started` → `→ read path/to/file`
-- Map `writeToolCall`, `shellToolCall` (if present), etc.
-
-Without this, runs still **work** — only live output is quieter.
-
-### Success detection (`RunResult.succeeded`)
-
-Today:
-
-```python
-succeeded = (
-    exit_code == 0
-    and error is None
-    and stop_reason in {"end_turn", "stop_sequence"}
-    and bool(final_text)
-)
-```
-
-Backend normalisation must ensure Cursor successes get a synthetic `stop_reason` so classification reaches `protocol.parse(final_text)`.
+Extend backend stream handler for Cursor tool lines. Runs work without this; output is just quieter.
 
 ---
 
 ## 7. Target project setup: CLAUDE.md vs AGENTS.md
 
-Odin's queue format is **unchanged**. Platform affects which **instruction file** the agent reads from project root.
-
 | Platform | Primary instructions | Odin startup warning if missing |
 |----------|---------------------|----------------------------------|
 | Claude | `CLAUDE.md` | warn if no `CLAUDE.md` |
-| Cursor | `AGENTS.md` (also reads `CLAUDE.md`, `.cursor/rules`) | warn if no `AGENTS.md` and no `.cursor/rules` |
+| Cursor | `AGENTS.md` (+ `.cursor/rules`) | warn if no `AGENTS.md` **and** no `.cursor/rules/` |
 
-### Cross-platform projects (recommended layout)
+Implement in **`cli.py:313-318`** (platform-aware) and **`cli.py:747-761`** (scan the platform's instruction file, not always `CLAUDE.md`).
 
-Use one workflow source of truth:
+### Cross-platform layout
 
 ```
 myproject/
 ├── AGENTS.md          # workflow rules (platform-neutral)
-├── CLAUDE.md          # one line: "Follow AGENTS.md for workflow."
-├── .cursor/rules/     # optional Cursor-specific scoped rules
+├── CLAUDE.md          # "Follow AGENTS.md for workflow."
+├── .cursor/rules/     # optional scoped Cursor rules
 └── queue/...
 ```
 
-Or the inverse (workflow in `CLAUDE.md`, Cursor stub in `AGENTS.md`). Odin's `guide` should gain a topic **`agent-md`** describing both.
-
-### What goes in the target instruction file (workflow only)
-
-Same content as today's `examples/target-claude-md-snippet.md` workflow section:
-
-- test-to-green before commit
-- one branch for the batch (Odin injects branch name in protocol)
-- no partial work — use `<<<NEEDS_INPUT>>>`
-- don't manage the queue
-
-The **sentinel protocol** stays injected by Odin (Claude via system prompt; Cursor via prepend).
-
-### Cursor-specific notes for authors
-
-- **`--force` is required** for headless edits — document in guide.
-- **Git repo:** Cursor applies rules more reliably in a git repo (documented Cursor behaviour).
-- **Permissions:** tune `~/.cursor/cli-config.json` for deny patterns (e.g. `Shell(rm:*)`).
-- **Model:** set via config or `--model`; default is account-dependent (`agent about` shows current).
+Add `odin guide agent-md` topic and `examples/target-agents-md-snippet.md`.
 
 ---
 
 ## 8. Metrics parity
 
-Keep the existing JSONL schema. Add optional fields rather than breaking consumers:
+Keep JSONL schema; add fields; stay backward compatible on read.
 
 ```json
 {
   "type": "task",
   "platform": "cursor",
   "cost_usd": null,
-  "cost_usd_estimated": false,
-  "tokens": { "input": 10888, "output": 31, "cache_read": 5440, "cache_creation": 0 },
-  "agent_duration_ms": 1333,
+  "tokens": { "input": 10760, "output": 46, "cache_read": 448, "cache_creation": 0 },
+  "agent_duration_ms": 4993,
+  "agent_api_ms": 4993,
   ...
 }
 ```
 
 Changes:
 
-- Rename `claude_duration_ms` → **`agent_duration_ms`** in new records; accept both when reading (backward compatible).
+- Rename **`claude_duration_ms` → `agent_duration_ms`** and **`claude_api_ms` → `agent_api_ms`** in new records; accept both names when reading.
 - **`platform`** on task and run records.
-- **`cost_usd`:** populate for Claude; `null` for Cursor until/unless the CLI exposes cost.
-- Token normalisation: one internal shape; map per backend via config `usage_*` keys.
+- **Task `cost_usd`:** Claude populates; Cursor `null`.
+- **Run `cost_usd_total` (decision B2):** when no task recorded a numeric cost, write **`null`**, not **`0.0`** — avoid implying "$0 spent". Update `RunAccumulator.finish` (`metrics.py:244`).
+- Token normalisation: one internal shape via backend config.
 
-`odin metrics` reports should show platform breakdown when mixed data exists.
+`odin metrics`: platform breakdown when mixed data exists.
 
 ---
 
-## 9. Lint and guide updates
+## 9. Lint, contract, and guide updates
 
 | Component | Change |
 |-----------|--------|
-| `lint.py` | Generalise to `scan_project_instructions(path, platform)` — same git-conflict patterns, any markdown file |
-| `cli._cmd_run` | Warn based on platform's expected instruction file |
-| `guide.py` | Platform-aware intro; document `AGENTS.md`; `odin guide agent-md` |
-| `contract.py` | Rename comment only; `build_system_prompt()` stays platform-neutral |
-| Tests | Fake backend scripts per platform (mirror `tests/test_runner.py`) |
+| `contract.py` | **Parameterise instruction-file name** in `_BASE` / `_BRANCH` runtime strings; `build_system_prompt(branch, platform=…)` |
+| `lint.py` | `scan_project_instructions(path, platform)` — same git-conflict patterns |
+| `cli._cmd_run` | Platform-aware missing-instruction warning (`:313-318`) |
+| `cli._setup_branch` | Platform-aware `_warn_claude_md_conflicts` → rename/generalise (`:747-761`) |
+| `guide.py` | Platform-aware intro; `odin guide agent-md`; protocol section uses parameterized contract |
+| `runner.py` | Generic loop + backend dispatch; fix stale docstring (`:5-6`); generic stderr label (`:170`) |
+| Tests | Fake backend scripts per platform (`tests/test_runner.py` pattern) |
 
 ---
 
-## 10. Implementation task queue (suggested Odin batches)
+## 10. Implementation task queue (reordered)
 
-Break into small, reviewable tasks. Order matters.
+### Batch A — Backend skeleton + config (no behaviour change)
 
-### Batch A — Backend skeleton (no behaviour change)
-
-1. **A1.** Add `src/odin/backends/` package: `base.py`, `claude.py`, `registry.py`.
-2. **A2.** Move `run_claude` logic into `ClaudeBackend`; `runner.run_agent(..., platform=...)` delegates.
-3. **A3.** Wire `--platform claude` (default); all existing tests green with zero diff in behaviour.
-4. **A4.** Add `config.py` — load TOML from `~/.odin/config.toml` (stdlib `tomllib`); no TOML dependency (Python 3.11+).
+1. **A1.** Add `src/odin/backends/`: `base.py`, `claude.py`, `registry.py`.
+2. **A2.** Add `config.py` — load TOML via stdlib `tomllib`; resolution for platform + model.
+3. **A2b.** Add `odin config` — interactive + `set`/`get`/`show`; hand-rolled TOML writer; `tests/test_config.py`.
+4. **A3.** Refactor `runner.py`: generic subprocess loop; `ClaudeBackend` owns argv/event/result; **`run_agent(..., backend=...)`**.
+5. **A4.** Wire `--platform claude` (default), `--model`; all existing tests green — zero behaviour diff.
 
 ### Batch B — Cursor backend
 
-5. **B1.** Implement `CursorBackend.build_invoke` + `normalise_result` (synthetic `stop_reason`, token mapping).
-6. **B2.** System prompt prepend path in invoke builder.
-7. **B3.** Stream renderer for `tool_call` events.
-8. **B4.** CLI: `--platform cursor`, `--agent-bin`, `--model`, `--force`, `--trust`, `--sandbox`, `--approve-mcps`.
-9. **B5.** Tests with fake `agent` script emitting Cursor-shaped NDJSON.
+6. **B1.** `CursorBackend.build_invoke` + `normalise_result` (`succeeded` without fake gate dependency).
+7. **B2.** System prompt prepend in invoke builder.
+8. **B3.** Stream renderer for `tool_call` events.
+9. **B4.** CLI: `--platform cursor`, `--agent-bin`, Cursor autonomy flags.
+10. **B5.** Tests with fake `agent` script (Cursor-shaped NDJSON).
 
-### Batch C — Metrics + docs
+### Batch C — Cross-platform polish
 
-10. **C1.** Metrics: `platform` field, `agent_duration_ms`, generalised `_norm_usage`.
-11. **C2.** Guide + `examples/target-agents-md-snippet.md`.
-12. **C3.** Update `CLAUDE.md` (Odin repo) architecture section.
-13. **C4.** Demo project: optional `--platform cursor` instructions in readme.
+11. **C1.** Metrics: `platform`, `agent_duration_ms`, `agent_api_ms`, null `cost_usd_total`.
+12. **C2.** **`contract.py` instruction-file parameterisation** + guide regeneration path.
+13. **C3.** Platform-aware `cli.py` warnings (`:313`, `:747`) + generalised `lint.py`.
+14. **C4.** Guide + `examples/target-agents-md-snippet.md`; update Odin repo `CLAUDE.md` architecture + metrics write-surface wording.
+15. **C5.** Dry-run uses `backend.build_invoke` (fix `:621-626`).
+16. **C6.** Demo fixture (**decision B3**): **keep demo Claude-only for v1**; document `odin run --platform cursor` in demo readme as manual step; optional future `AGENTS.md` variant in `otest`.
 
-### Batch D — Extensibility (when adding Kiro)
+### Batch D — Extensibility (Kiro, …)
 
-14. **D1.** Document backend plugin checklist in this file.
-15. **D2.** Add `platforms.kiro` stub in example config only.
+17. **D1.** Backend implementer's checklist (§11).
+18. **D2.** `platforms.kiro` stub in example config.
 
 ---
 
 ## 11. Backend implementer's checklist (Kiro, Codex, …)
 
-To add a platform:
-
-1. **Binary + headless flag** — e.g. `foo --print`, `foo -p`, `foo --headless`.
-2. **Structured output** — prefer NDJSON stream with terminal `result` event; else wrap plain text.
-3. **Prompt stdin vs argv** — implement `prompt_via` in config.
-4. **System/protocol injection** — flag, prepend, or project file.
-5. **Autonomy defaults** — match Odin's "unattended batch" posture.
-6. **Normalise to `RunResult`** — especially `stop_reason`, `final_text`, `usage`, `cost_usd`.
-7. **Stream display** — map tool events to one-line summaries (optional but nice).
-8. **Instruction file** — what the agent loads from project root.
-9. **Tests** — fake script + scenario env var pattern from `tests/test_runner.py`.
+1. Binary + headless flag (`-p`, `--print`, …)
+2. Structured output — prefer NDJSON + terminal `result`
+3. Prompt stdin vs argv
+4. System/protocol injection — flag, prepend, or project file
+5. Autonomy defaults for unattended batches
+6. **`normalise_result` → `RunResult` with correct `succeeded`**
+7. Stream display (optional)
+8. Instruction file(s) for startup warnings
+9. Fake-script tests
 
 ---
 
@@ -483,59 +538,46 @@ To add a platform:
 
 | Risk | Mitigation |
 |------|------------|
-| Cursor `-p` hangs on some versions | Document minimum CLI version; integration test; clear timeout guidance (future) |
-| No dollar cost from Cursor | `cost_usd: null` in metrics; show tokens + duration in banner |
-| Protocol in user prompt ignored | Contract text already states precedence; monitor `failed/` for unparseable output |
-| Tool permission models differ | Document Cursor `cli-config.json`; don't pretend `--allowed-tools` works cross-platform |
-| `--max-turns` missing on Cursor | Omit flag; document circuit-breaker as Claude-only until Cursor adds it |
-| Instruction file fragmentation | Guide cross-platform `AGENTS.md` + stub pattern |
+| Cursor `-p` hangs on some versions | Document min CLI version; Appendix C as baseline |
+| No dollar cost from Cursor | `cost_usd: null`; show tokens + duration in banner |
+| Prepend protocol ignored | Contract states precedence; monitor `failed/` unparseable rate |
+| Tool permission models differ | Document Cursor `cli-config.json`; no fake `--allowed-tools` parity |
+| `--max-turns` Claude-only | No-op + warning on Cursor |
+| Pre-startup errors without `result` event | Non-zero exit + stderr → `failed/` (same as today) |
+| Hung trust/MCP prompt | Default `--trust --approve-mcps`; document requirement |
+| TOML writer drops comments | Document; only `odin config` writes |
 
 ---
 
-## 13. Quick reference: run the same queue on Cursor
+## 13. Quick reference: run on Cursor
 
 ```sh
-# One-time: install Cursor CLI, login, optional ~/.odin/config.toml
 agent login
 agent about
 
-# In target project: add AGENTS.md with workflow rules (see §7)
+# Set defaults interactively
+odin config
 
-# Run queue
-cd ~/code/myproject
-odin run add-feature --platform cursor --project . --branch add-feature --force --trust
+cd ~/code/myproject   # needs AGENTS.md (or .cursor/rules)
+odin run add-feature --platform cursor --branch add-feature
 
-# Or set default
+# Or env defaults
 export ODIN_PLATFORM=cursor
+export ODIN_MODEL=composer-2.5-fast
 odin run add-feature
 ```
 
-Equivalent bare `agent` invocation for one task (what Odin wraps):
-
-```sh
-cd ~/code/myproject
-agent -p --output-format stream-json --force --trust --workspace . <<'EOF'
-<!-- ODIN_PROTOCOL -->
-(you are being run by Odin … sentinel rules …)
-<!-- END ODIN_PROTOCOL -->
-
-## Context from previous task
-...
-
----
-(task markdown body)
-EOF
-```
-
 ---
 
-## 14. Open questions (decide before coding)
+## 14. Open questions
 
-1. **Config format:** TOML only, or also support JSON? (Recommend TOML — stdlib `tomllib`, no deps.)
-2. **Flag aliases:** Keep `--claude-bin` forever, or deprecate in favour of `--agent-bin` + `--platform`?
-3. **Cost estimation:** Attempt list-price estimate from tokens + model for Cursor, or leave null until official?
-4. **Project config v2:** Needed for monorepos with different models per project?
-5. **Rename `CLAUDE.md` references in Odin repo docs** to "project instructions" in user-facing text?
+1. **Config format:** TOML only? *(Recommend yes — stdlib read, hand-rolled write.)*
+2. **`$ODIN_MODEL` env tier:** included above — confirm?
+3. **`odin config` model validation:** accept any string vs validate against `agent models` / `claude` list?
+4. **`odin config init`:** separate command vs create-on-first-`odin config`?
+5. **Cost estimation:** derive Cursor `$` from tokens + model, or stay null until CLI exposes cost?
+6. **Project config v2:** monorepo overrides needed?
+7. **Demo `AGENTS.md` variant:** defer (B3) or ship in v1?
 
 ---
 
@@ -546,31 +588,99 @@ EOF
 | Binary | `claude` | `agent` |
 | Headless | `-p` | `-p` / `--print` |
 | Stream JSON | `--output-format stream-json` | same |
-| Verbose stream | `--verbose` | *(not needed)* |
+| Verbose | `--verbose` | not needed |
 | Full autonomy | `--permission-mode bypassPermissions` | `--force --trust` |
-| System prompt | `--append-system-prompt` | prepend to prompt |
-| Workspace | `--project` cwd | `--workspace` + cwd |
-| Model | config / env | `--model` |
+| System prompt | `--append-system-prompt` (`runner.py:87-88`) | prepend to prompt |
+| Workspace | cwd | `--workspace` + cwd |
+| Model | `--model` (new in Odin) | `--model` |
 | Fresh session | no `--resume` | no `--continue` |
-| Metrics cost | `total_cost_usd` | not available (v1) |
-| Metrics tokens | snake_case | camelCase |
+| Cost in result | `total_cost_usd` | absent |
+| Tokens | snake_case | camelCase |
+| `stop_reason` | present | absent |
 
-## Appendix B — Files to touch (implementation estimate)
+## Appendix B — Files to touch
 
-| File | Change size |
-|------|-------------|
+| File | Change |
+|------|--------|
 | `src/odin/backends/*.py` | **new** |
-| `src/odin/config.py` | **new** |
-| `src/odin/runner.py` | refactor → thin wrapper |
-| `src/odin/cli.py` | medium |
-| `src/odin/metrics.py` | small |
-| `src/odin/lint.py` | small |
-| `src/odin/guide.py` | medium |
+| `src/odin/config.py` | **new** (read + hand-rolled write) |
+| `src/odin/runner.py` | refactor — generic loop, backend dispatch, stderr label |
+| `src/odin/cli.py` | medium — platform, model, config subcommand, warnings, dry-run |
+| `src/odin/contract.py` | **parameterise instruction-file strings** |
+| `src/odin/metrics.py` | rename fields, null total cost |
+| `src/odin/lint.py` | generalise |
+| `src/odin/guide.py` | platform topics |
+| `src/odin/prompts.py` | reuse for `odin config` menus |
 | `tests/test_runner.py` | extend |
 | `tests/test_backends.py` | **new** |
 | `tests/test_config.py` | **new** |
-| `CLAUDE.md` | doc update |
+| `CLAUDE.md` | architecture + write surfaces |
 | `examples/target-agents-md-snippet.md` | **new** |
+
+## Appendix C — Empirical verification (Cursor system)
+
+Environment: macOS, `agent` **`2026.06.04-5fd875e`**, logged in (Team). Run 2026-06-09.
+
+### C.1 Binary, version, flags
+
+```
+$ agent --version
+2026.06.04-5fd875e
+```
+
+Relevant flags confirmed on `agent -p --help`: `--output-format`, `--model`, `--force`/`--yolo`, `--trust`, `--workspace`, `--sandbox`, `--approve-mcps`. No system-prompt flag.
+
+### C.2 stdin prompt, piped, stream-json
+
+```bash
+printf 'Reply with the single word: pong' | agent -p --output-format stream-json --force --trust --workspace "$PWD"
+```
+
+Exit 0. Full stream ended with terminal `result` (C.3).
+
+### C.3 Terminal `result` event (verbatim)
+
+```json
+{"type":"result","subtype":"success","duration_ms":4993,"duration_api_ms":4993,"is_error":false,"result":"pong","session_id":"7bfeef23-655d-4191-bdf4-61b9bdc0621f","request_id":"0cc5c6e7-6e8e-4035-851c-d888633106d8","usage":{"inputTokens":10760,"outputTokens":46,"cacheReadTokens":448,"cacheWriteTokens":0}}
+```
+
+**Absent:** `stop_reason`, `total_cost_usd`, `num_turns`. **Present:** `is_error: false`, `duration_ms`, `duration_api_ms`, camelCase `usage`.
+
+### C.4 Non-happy paths
+
+| Case | Terminal `result`? | Exit code |
+|------|-------------------|-----------|
+| Invalid `--model totally-invalid-model-xyz` | **No** — stderr only: `Cannot use this model: … Available models: …` | **1** |
+| Agent completes but shell tool returns 42 | **Yes** — `subtype: success`, `is_error: false` | **0** |
+| Fictional tool request (agent explains) | **Yes** — `subtype: success` | **0** |
+
+Odin must treat **missing terminal `result` + non-zero exit** as failure (already true for Claude).
+
+### C.5 Full autonomy (non-TTY)
+
+```bash
+printf 'Create autonomy-test.txt … then cat …' | agent -p --output-format stream-json --force --trust --sandbox disabled --approve-mcps --workspace "$PWD"
+```
+
+Exit 0. File created; `editToolCall` + `shellToolCall` completed without blocking prompts.
+
+### C.6 Instruction files
+
+Project with `AGENTS.md` containing `# test agents`. Prompt: "What is the exact first heading line in AGENTS.md?"
+
+- With `--workspace "$PWD"`: agent `readToolCall` on `AGENTS.md`; answered `# test agents`.
+- Without `--workspace` but cwd set: same behaviour.
+
+Recommend still passing **`--workspace`** explicitly for parity with Odin's `--project`.
+
+### C.7 System prompt mechanism
+
+```bash
+$ agent -p --help 2>&1 | grep -i system
+  about [options]              Display version, system, and account information
+```
+
+No `--append-system-prompt` or equivalent → **prepend design validated**.
 
 ---
 
