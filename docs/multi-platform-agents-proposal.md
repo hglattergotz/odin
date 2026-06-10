@@ -1,6 +1,6 @@
 # Multi-platform agent backends for Odin
 
-**Status:** Proposal (branch `cursor`, PR #1) — revised after round-1 review  
+**Status:** Proposal (branch `cursor`, PR #1) — **approved to lock** (round-3 review, commit `8fb2e2e` + R3 clarifications below)  
 **Goal:** Let Odin orchestrate tasks through multiple headless agent CLIs — starting with **Claude Code** (`claude`) and **Cursor Agent** (`agent`), with a path to **Kiro** and others — without degrading existing behaviour.
 
 This document is written to be split into an Odin task queue. It assumes you have read `CLAUDE.md` in this repo and understand how Odin works today.
@@ -95,7 +95,12 @@ class RunResult:              # already exists — extend carefully (frozen data
 
 Today `succeeded` is computed inside the runner (`runner.py:174-179`) *after* stream parsing. For Cursor, **`stop_reason` is absent on success**, so a naive gate would route every Cursor success to `failed/`.
 
-**Recommendation:** move success classification into `normalise_result` (or add `backend.classify_run(terminal_event, exit_code) -> bool`). The runner calls the backend and trusts `RunResult.succeeded`. Backends may still populate a synthetic `stop_reason` for metrics/debug, but **`succeeded` must not depend on faking `stop_reason` through the old gate**.
+**Recommendation:** move success classification into `normalise_result`. The runner calls the backend and trusts `RunResult.succeeded`. Backends may still populate a synthetic `stop_reason` for metrics/debug, but **`succeeded` must not depend on faking `stop_reason` through the old gate**.
+
+**Concrete predicates (pin before coding):**
+
+- **ClaudeBackend:** `succeeded = (exit_code == 0 and error is None and stop_reason in {"end_turn", "stop_sequence"} and bool(final_text))` — same logic as today (`runner.py:174-179`), just relocated.
+- **CursorBackend:** `succeeded = (exit_code == 0 and terminal_result_present and event.get("is_error") is not True and bool(final_text))` — missing terminal `result` or non-zero exit → failure; **missing `is_error` counts as not-an-error** (consistent with `runner.py:254`). Do not require `stop_reason`.
 
 Each backend provides:
 
@@ -404,7 +409,7 @@ Appendix C.5: on the test system, `--force --trust` allowed file edits + shell w
 | Field | Claude | Cursor | Odin action |
 |-------|--------|--------|-------------|
 | `stop_reason` | present | absent | Optional synthetic value for logs; **`succeeded` set by backend** |
-| `is_error` | usually present on failure | present on success | Treat **missing as not-an-error** (consistent with `runner.py:254`) |
+| `is_error` | not relied on (success driven by `stop_reason` / `subtype`) | present on success (`false`) | Normalisation: **missing = not-an-error** (consistent with `runner.py:254`) |
 | `total_cost_usd` | present | absent | `cost_usd: null` |
 | Token keys | snake_case | camelCase | Map via config `usage_*` keys |
 | `thinking` events | N/A | emitted in stream | Ignore for display (Cursor docs: suppressed in some modes; observed in tests) |
@@ -465,8 +470,8 @@ Changes:
 - Rename **`claude_duration_ms` → `agent_duration_ms`** and **`claude_api_ms` → `agent_api_ms`** in new records; accept both names when reading.
 - **`platform`** on task and run records.
 - **Task `cost_usd`:** Claude populates; Cursor `null`.
-- **Run `cost_usd_total` (decision B2):** when no task recorded a numeric cost, write **`null`**, not **`0.0`** — avoid implying "$0 spent". Update `RunAccumulator.finish` (`metrics.py:244`).
-- Token normalisation: one internal shape via backend config.
+- **Run `cost_usd_total` (decision B2):** when no task recorded a numeric cost, write **`null`**, not **`0.0`**. This touches **two sites:** `record_task` accumulates into `cost_total` (initialised `0.0` at `metrics.py:167`; only adds when cost is numeric at `:181-182`) and `finish` emits `cost_usd_total` (`metrics.py:244`). Add an `_any_cost: bool` flag in `record_task`; set true when any task yields a numeric `cost_usd`. In `finish`, emit **`null`** when `_any_cost` is false — `finish` alone cannot distinguish "no costs seen" from "costs summed to 0.0".
+- **Token normalisation:** backends map platform-specific usage keys to Odin's **internal** token dict — the same keys `_norm_usage` / `_TOKEN_KEYS` use today: `input`, `output`, `cache_read`, `cache_creation` (`metrics.py:45,110-117`). The `[platforms.*.metrics]` config maps *from* CLI field names *to* those four internal names so mixed-platform `odin metrics` aggregation sums correctly (R3-5).
 
 `odin metrics`: platform breakdown when mixed data exists.
 
@@ -488,17 +493,19 @@ Changes:
 
 ## 10. Implementation task queue (reordered)
 
+**Rule:** every batch ends with the **full test suite green**. No batch leaves a broken build.
+
 ### Batch A — Backend skeleton + config (no behaviour change)
 
 1. **A1.** Add `src/odin/backends/`: `base.py`, `claude.py`, `registry.py`.
 2. **A2.** Add `config.py` — load TOML via stdlib `tomllib`; resolution for platform + model.
 3. **A2b.** Add `odin config` — interactive + `set`/`get`/`show`; hand-rolled TOML writer; `tests/test_config.py`.
-4. **A3.** Refactor `runner.py`: generic subprocess loop; `ClaudeBackend` owns argv/event/result; **`run_agent(..., backend=...)`**.
+4. **A3.** Refactor `runner.py`: generic subprocess loop; `ClaudeBackend` owns argv/event/result; **`run_agent(..., backend=...)`**. **Also switch `cli.py:630` to the default `ClaudeBackend`** so tests stay green before A4 lands.
 5. **A4.** Wire `--platform claude` (default), `--model`; all existing tests green — zero behaviour diff.
 
 ### Batch B — Cursor backend
 
-6. **B1.** `CursorBackend.build_invoke` + `normalise_result` (`succeeded` without fake gate dependency).
+6. **B1.** `CursorBackend.build_invoke` + `normalise_result` using the **pinned Cursor success predicate** (§2).
 7. **B2.** System prompt prepend in invoke builder.
 8. **B3.** Stream renderer for `tool_call` events.
 9. **B4.** CLI: `--platform cursor`, `--agent-bin`, Cursor autonomy flags.
