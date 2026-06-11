@@ -58,15 +58,94 @@ def test_claude_metadata():
     assert backend.instruction_files() == [Path("CLAUDE.md")]
 
 
-def test_claude_invoke_methods_are_stubs():
-    backend = get_backend()
-    opts = RunOptions()
-    with pytest.raises(NotImplementedError):
-        backend.build_invoke("p", Path("."), None, opts)
-    with pytest.raises(NotImplementedError):
-        backend.handle_stream_event({}, out=None)  # type: ignore[arg-type]
-    with pytest.raises(NotImplementedError):
-        backend.normalise_result(None, 0, 0, "")
+def test_build_invoke_baseline_argv():
+    backend = ClaudeBackend()
+    spec = backend.build_invoke("the prompt", Path("/proj"), None, RunOptions())
+    assert spec.prompt == "the prompt"        # prompt rides on stdin, unchanged
+    assert spec.cwd == Path("/proj")
+    assert spec.argv[0] == "claude"           # default binary
+    assert spec.argv[1] == "-p"
+    assert "--output-format" in spec.argv and "stream-json" in spec.argv
+    assert "--verbose" in spec.argv
+    i = spec.argv.index("--permission-mode")
+    assert spec.argv[i + 1] == "bypassPermissions"
+    # No optional flags unless asked.
+    for flag in ("--model", "--max-turns", "--append-system-prompt",
+                 "--allowed-tools", "--disallowed-tools"):
+        assert flag not in spec.argv
+
+
+def test_build_invoke_optional_flags():
+    backend = ClaudeBackend()
+    opts = RunOptions(
+        binary="/path/to/claude",
+        model="claude-sonnet-4-6",
+        max_turns=42,
+        allowed_tools=["Read", "Bash"],
+        disallowed_tools=["WebFetch"],
+        permission_mode="acceptEdits",
+    )
+    spec = backend.build_invoke("p", Path("/proj"), "CONTRACT", opts)
+    assert spec.argv[0] == "/path/to/claude"
+    i = spec.argv.index("--model")
+    assert spec.argv[i + 1] == "claude-sonnet-4-6"
+    j = spec.argv.index("--max-turns")
+    assert spec.argv[j + 1] == "42"
+    k = spec.argv.index("--append-system-prompt")
+    assert spec.argv[k + 1] == "CONTRACT"
+    assert spec.argv[spec.argv.index("--allowed-tools") + 1] == "Read,Bash"
+    assert spec.argv[spec.argv.index("--disallowed-tools") + 1] == "WebFetch"
+    assert spec.argv[spec.argv.index("--permission-mode") + 1] == "acceptEdits"
+
+
+def test_normalise_result_success():
+    backend = ClaudeBackend()
+    event = {
+        "type": "result", "subtype": "success", "stop_reason": "end_turn",
+        "is_error": False, "result": "done\n<<<NEXT_CONTEXT>>>\nx\n<<<END>>>",
+        "session_id": "sess-9", "usage": {"input_tokens": 3},
+        "total_cost_usd": 0.5, "duration_ms": 100, "duration_api_ms": 90,
+        "num_turns": 4,
+    }
+    r = backend.normalise_result(event, exit_code=0, wall_ms=123, stderr="")
+    assert r.succeeded is True
+    assert r.platform == "claude"
+    assert r.stop_reason == "end_turn"
+    assert r.session_id == "sess-9"
+    assert r.cost_usd == 0.5
+    assert r.api_ms == 90 and r.duration_ms == 100 and r.num_turns == 4
+    assert r.usage == {"input_tokens": 3}
+    assert r.wall_ms == 123
+    assert r.error is None
+
+
+def test_normalise_result_no_terminal_event_with_nonzero_exit():
+    backend = ClaudeBackend()
+    r = backend.normalise_result(None, exit_code=2, wall_ms=5, stderr="boom\n")
+    assert r.succeeded is False
+    assert r.exit_code == 2
+    assert r.error == "boom"          # falls back to stderr on a failed exit
+    assert r.final_text == ""
+
+
+def test_normalise_result_error_subtype():
+    backend = ClaudeBackend()
+    event = {"type": "result", "subtype": "error_max_turns",
+             "stop_reason": "max_turns", "is_error": True, "result": "hit limit"}
+    r = backend.normalise_result(event, exit_code=0, wall_ms=1, stderr="")
+    assert r.succeeded is False
+    assert r.error == "error_max_turns"
+    assert r.stop_reason == "max_turns"
+
+
+def test_normalise_result_bad_stop_reason_fails():
+    backend = ClaudeBackend()
+    # Clean exit, no error, but a non-terminal stop reason and text present:
+    # tool_use is not a "done" stop, so this is not a success.
+    event = {"type": "result", "subtype": "success", "stop_reason": "tool_use",
+             "is_error": False, "result": "still going"}
+    r = backend.normalise_result(event, exit_code=0, wall_ms=1, stderr="")
+    assert r.succeeded is False
 
 
 def test_invoke_spec_is_frozen():

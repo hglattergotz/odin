@@ -1,14 +1,16 @@
-"""Subprocess wrapper around `claude -p`.
+"""Generic headless-agent subprocess loop.
 
-We invoke Claude Code in headless streaming mode:
+Odin drives every agent CLI the same way: spawn it in headless streaming mode,
+feed the prompt on stdin (so we never deal with shell quoting), parse the NDJSON
+event stream line by line, surface assistant text and tool activity to the
+user's terminal as it arrives, and capture the terminal `result` event for the
+orchestrator to classify.
 
-    claude -p --output-format stream-json --verbose --permission-mode <mode> \
-        [--allowed-tools <csv>] --max-turns <n>
-
-The prompt is passed on stdin so we never deal with shell quoting. Each
-stream-json event is parsed; assistant text snippets are surfaced to the
-user's terminal as they arrive, and the final `result` event is captured
-for the orchestrator to classify.
+Everything *platform-specific* — building the argv, rendering each stream event,
+and normalising the terminal event into a `RunResult` (including the success
+gate) — lives in an `AgentBackend` (see `odin.backends`). `run_agent` owns only
+the platform-agnostic machinery: process exec, the concurrent stderr drain,
+the NDJSON line loop, and wall-clock timing.
 
 No retry, no resume — fresh session per call by design.
 """
@@ -23,9 +25,12 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 
 from odin import style
+
+if TYPE_CHECKING:  # import only for typing — avoids loading the backends package
+    from odin.backends.base import AgentBackend, RunOptions
 
 
 @dataclass(frozen=True)
@@ -36,6 +41,7 @@ class RunResult:
     error: str | None        # error text from the result event, if any
     exit_code: int
     session_id: str | None
+    platform: str = "claude"  # which backend produced this result
     # Metrics captured from the terminal `result` event + our own timing.
     # All optional so a missing/older result event never breaks construction.
     wall_ms: int = 0                  # Odin-measured subprocess wall time
@@ -46,55 +52,41 @@ class RunResult:
     cost_usd: float | None = None     # total_cost_usd from the result event
 
 
-_GOOD_STOPS = {"end_turn", "stop_sequence"}
-
-
-def run_claude(
+def run_agent(
     prompt: str,
     project_dir: Path,
+    backend: "AgentBackend",
     *,
-    claude_bin: str = "claude",
-    permission_mode: str = "bypassPermissions",
-    allowed_tools: list[str] | None = None,
-    disallowed_tools: list[str] | None = None,
-    max_turns: int | None = None,
     system_prompt: str | None = None,
+    run_options: "RunOptions | None" = None,
     out: TextIO | None = None,
 ) -> RunResult:
-    """Invoke `claude -p` with `prompt` in `project_dir`.
+    """Run one task through `backend` in `project_dir`, returning its `RunResult`.
 
-    `out` defaults to sys.stdout — pass a sink for tests. Streaming output
+    The platform-agnostic loop: ask the backend to build the invocation, exec it,
+    write the prompt on stdin, drain stderr concurrently, dispatch each NDJSON
+    event to the backend for live display, and hand the terminal `result` event
+    (or its absence) to the backend's `normalise_result` — which owns the success
+    gate. `out` defaults to sys.stdout; pass a sink for tests. Streaming display
     is best-effort: we never let display failures break the run.
     """
     if out is None:
         out = sys.stdout
+    if run_options is None:
+        # Lazy import keeps `odin.backends` off runner's module-load path, so the
+        # backends package (which imports runner) can't form an import cycle.
+        from odin.backends.base import RunOptions
+        run_options = RunOptions()
 
     if not project_dir.is_dir():
         raise FileNotFoundError(f"project dir does not exist: {project_dir}")
 
-    cmd = [
-        claude_bin,
-        "-p",
-        "--output-format", "stream-json",
-        "--verbose",
-        "--permission-mode", permission_mode,
-    ]
-    # No turn cap by default — an arbitrary limit can kill a healthy, in-progress
-    # session (and isn't imposed on an interactive run). Only cap when explicitly
-    # asked via max_turns.
-    if max_turns is not None:
-        cmd += ["--max-turns", str(max_turns)]
-    if system_prompt:
-        cmd += ["--append-system-prompt", system_prompt]
-    if allowed_tools:
-        cmd += ["--allowed-tools", ",".join(allowed_tools)]
-    if disallowed_tools:
-        cmd += ["--disallowed-tools", ",".join(disallowed_tools)]
+    spec = backend.build_invoke(prompt, project_dir, system_prompt, run_options)
 
     start = time.monotonic()
     proc = subprocess.Popen(
-        cmd,
-        cwd=str(project_dir),
+        spec.argv,
+        cwd=str(spec.cwd),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -119,21 +111,18 @@ def run_claude(
     stderr_thread.start()
 
     try:
-        proc.stdin.write(prompt)
+        proc.stdin.write(spec.prompt)
         proc.stdin.close()
     except BrokenPipeError:
         # The CLI exited before reading our prompt; we'll see it via wait().
         pass
 
-    final_text = ""
-    stop_reason: str | None = None
-    error: str | None = None
-    session_id: str | None = None
-    usage: dict | None = None
-    cost_usd: float | None = None
-    duration_ms: int | None = None
-    api_ms: int | None = None
-    num_turns: int | None = None
+    # The terminal event (NDJSON `result`) carries the final text, stop info, and
+    # metrics. We dispatch every event to the backend for live display and keep
+    # the last `result`-typed event to hand to `normalise_result`. The terminal
+    # `result` event is the cross-platform NDJSON convention (proposal §6); a
+    # backend that needs different framing can ignore what we capture here.
+    terminal_event: dict | None = None
 
     for line in proc.stdout:
         line = line.rstrip("\n")
@@ -144,119 +133,29 @@ def run_claude(
         except json.JSONDecodeError:
             _safe_write(out, "   " + style.dim(f"[non-JSON] {line}", out) + "\n")
             continue
-        captured = _handle_event(event, out, project_dir)
-        if captured is not None:
-            final_text = captured.get("final_text", final_text) or final_text
-            stop_reason = captured.get("stop_reason", stop_reason) or stop_reason
-            error = captured.get("error", error) or error
-            session_id = captured.get("session_id", session_id) or session_id
-            # Metrics fields appear only on the terminal `result` event.
-            if captured.get("usage") is not None:
-                usage = captured["usage"]
-            if captured.get("cost_usd") is not None:
-                cost_usd = captured["cost_usd"]
-            if captured.get("duration_ms") is not None:
-                duration_ms = captured["duration_ms"]
-            if captured.get("api_ms") is not None:
-                api_ms = captured["api_ms"]
-            if captured.get("num_turns") is not None:
-                num_turns = captured["num_turns"]
+        backend.handle_stream_event(event, out, project_dir)
+        if event.get("type") == "result":
+            terminal_event = event
 
     exit_code = proc.wait()
     wall_ms = int((time.monotonic() - start) * 1000)
     stderr_thread.join(timeout=5)
     stderr_text = "".join(stderr_chunks)
     if stderr_text.strip():
-        _safe_write(out, "   " + style.dim("[claude stderr]", out) + "\n")
+        _safe_write(out, "   " + style.dim("[stderr]", out) + "\n")
         for sline in stderr_text.rstrip("\n").split("\n"):
             _safe_write(out, "   " + style.dim(sline, out) + "\n")
 
-    succeeded = (
-        exit_code == 0
-        and error is None
-        and (stop_reason in _GOOD_STOPS if stop_reason else False)
-        and bool(final_text)
-    )
-    return RunResult(
-        succeeded=succeeded,
-        final_text=final_text,
-        stop_reason=stop_reason,
-        error=error or (stderr_text.strip() or None if exit_code != 0 else None),
-        exit_code=exit_code,
-        session_id=session_id,
-        wall_ms=wall_ms,
-        duration_ms=duration_ms,
-        api_ms=api_ms,
-        num_turns=num_turns,
-        usage=usage,
-        cost_usd=cost_usd,
-    )
+    return backend.normalise_result(terminal_event, exit_code, wall_ms, stderr_text)
 
 
 # ----------------------------------------------------------------------
-# event handling
+# stream rendering helpers (shared across backends)
 # ----------------------------------------------------------------------
-
-def _handle_event(
-    event: dict, out: TextIO, project_dir: Path | None = None
-) -> dict | None:
-    """Render the event to the user and, if it's a terminal event, return
-    a dict of captured fields. Non-terminal events return None.
-
-    `project_dir` is used to abbreviate path-type tool details relative to the
-    project; it's optional so tests can call this without it.
-    """
-    etype = event.get("type")
-
-    if etype == "system" and event.get("subtype") == "init":
-        sid = event.get("session_id")
-        _safe_write(out, "  " + style.dim(f"[session {_short_session(sid)}]", out) + "\n")
-        return {"session_id": sid}
-
-    if etype == "assistant":
-        text = _assistant_text(event)
-        if text:
-            # Blank line + cyan bullet frames the block. Markdown emphasis is
-            # rendered and the <<<...>>> handoff fences are prettified for the
-            # terminal (cosmetic only — the protocol is parsed from `result`).
-            rendered = _render_agent_text(text, out)
-            _safe_write(out, "\n" + style.bullet(style.GLYPH_BULLET, out) + " " + rendered)
-            if not rendered.endswith("\n"):
-                _safe_write(out, "\n")
-        for name, detail in _tool_calls(event, project_dir):
-            line = "   " + style.tool(f"{style.GLYPH_ARROW} {name}", out)
-            if detail:
-                line += "  " + style.dim(detail, out)
-            _safe_write(out, line + "\n")
-        return None
-
-    if etype == "user":
-        # Tool results — keep the terminal quiet unless there's an error.
-        return None
-
-    if etype == "result":
-        # Terminal event. Fields per Claude Code docs:
-        #   subtype: "success" | "error_max_turns" | "error_during_execution"
-        #   result: final assistant text
-        #   stop_reason: end_turn | max_turns | tool_use | ...
-        #   is_error: bool
-        #   session_id, usage, total_cost_usd
-        captured = {
-            "final_text": event.get("result") or "",
-            "stop_reason": event.get("stop_reason"),
-            "session_id": event.get("session_id"),
-            "usage": event.get("usage"),
-            "cost_usd": event.get("total_cost_usd"),
-            "duration_ms": event.get("duration_ms"),
-            "api_ms": event.get("duration_api_ms"),
-            "num_turns": event.get("num_turns"),
-        }
-        if event.get("is_error") or event.get("subtype") != "success":
-            captured["error"] = event.get("subtype") or "unknown error"
-        return captured
-
-    return None
-
+# These primitives render the parts of the NDJSON stream that look the same
+# across agent CLIs — assistant text blocks, the session-init line, tool-call
+# activity lines. A backend's `handle_stream_event` decides which events route
+# to which primitive (Cursor frames tool activity differently, for example).
 
 def _assistant_text(event: dict) -> str:
     """Extract text content from an assistant event's message blocks."""

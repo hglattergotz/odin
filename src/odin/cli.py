@@ -30,7 +30,8 @@ from .protocol import (
     FollowUp, Outcome, Question, parse, parse_follow_ups, parse_questions, unwrap_fence,
 )
 from .queue import Queue, Task, archive_finished_subqueues, archived_subqueues
-from .runner import RunResult, run_claude
+from .backends import ClaudeBackend, RunOptions
+from .runner import RunResult, run_agent
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -651,15 +652,18 @@ def _run_loop(
 
         sig.task_start(completed)
         running = q.claim_running(task)
-        result = run_claude(
+        result = run_agent(
             prompt,
             project,
-            claude_bin=args.claude_bin,
-            permission_mode=args.permission_mode,
-            allowed_tools=allowed,
-            disallowed_tools=disallowed,
-            max_turns=args.max_turns,
+            ClaudeBackend(),
             system_prompt=system_prompt,
+            run_options=RunOptions(
+                binary=args.claude_bin,
+                permission_mode=args.permission_mode,
+                allowed_tools=allowed or [],
+                disallowed_tools=disallowed or [],
+                max_turns=args.max_turns,
+            ),
         )
         outcome, questions, follow_ups = _route(q, running, result)
         acc.record_task(task_stem=running.stem, outcome=outcome, result=result)

@@ -62,7 +62,7 @@ def _drive(tmp_path, monkeypatch, *, tasks, results, branch=None):
         (q.root / "pending" / name).write_text("body", encoding="utf-8")
 
     seq = list(results)
-    monkeypatch.setattr("odin.cli.run_claude", lambda *a, **k: seq.pop(0))
+    monkeypatch.setattr("odin.cli.run_agent", lambda *a, **k: seq.pop(0))
     args = _build_parser().parse_args(["run", str(qdir)])
     acc = metrics.RunAccumulator(
         run_id="t", project=project, queue=q.root, branch=branch, enabled=False

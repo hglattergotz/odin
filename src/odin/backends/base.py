@@ -25,9 +25,11 @@ if TYPE_CHECKING:  # avoid an import cycle at runtime — runner imports nothing
     from odin.runner import RunResult
 
 
-# A backend's stream handler returns the same shape `runner._handle_event`
-# produces today: a dict of fields captured from a (usually terminal) event, or
-# None for non-terminal events. Kept as a plain alias so existing code drops in.
+# A backend's stream handler may return a dict of fields captured from an event
+# (e.g. the session id from the init event), or None when an event contributes
+# nothing. It is primarily a live-display hook; the runner reads the terminal
+# `result` event itself and hands it to `normalise_result`. Kept as a plain
+# alias so backends can return ordinary dicts.
 CapturedFields = dict
 
 
@@ -49,7 +51,8 @@ class AgentInvokeSpec:
 class RunOptions:
     """Platform-agnostic knobs the loop hands to `build_invoke`.
 
-    These mirror the keyword arguments `runner.run_claude` accepts today, plus
+    These mirror the keyword arguments `runner.run_claude` accepted before the
+    backend split, plus
     `model` (the new platform-agnostic `--model`, proposal §3). A backend reads
     only the fields meaningful to it and ignores the rest; platform-specific
     autonomy flags (Cursor's `--force`/`--trust`/`--sandbox`) arrive in a later
@@ -108,8 +111,9 @@ class AgentBackend(ABC):
     ) -> CapturedFields | None:
         """Render one NDJSON stream event live; return captured fields or None.
 
-        Non-terminal events return None; the terminal event returns the dict the
-        loop accumulates into a `RunResult`.
+        This is a live-display hook. The runner captures the terminal `result`
+        event on its own and passes it to `normalise_result`, so the return value
+        is advisory (handy for unit-testing what an event yields).
         """
         raise NotImplementedError
 

@@ -14,9 +14,15 @@ from pathlib import Path
 
 import pytest
 
+from odin.backends import ClaudeBackend, RunOptions
 from odin.runner import (
-    _abbrev_path, _handle_event, _render_agent_text, _tool_detail, run_claude,
+    _abbrev_path, _render_agent_text, _tool_detail, run_agent,
 )
+
+
+def _handle_event(event, out, project_dir=None):
+    """Shim: the per-event renderer moved into ClaudeBackend (Batch A3)."""
+    return ClaudeBackend().handle_stream_event(event, out, project_dir)
 
 
 FAKE_SCRIPT = r"""#!/bin/sh
@@ -89,15 +95,22 @@ def project_dir(tmp_path: Path) -> Path:
     return p
 
 
+def _run_agent(project: Path, fake: Path, *, out=None, **opts):
+    """Invoke the generic loop with the Claude backend and a fake `claude`."""
+    return run_agent(
+        "do the thing",
+        project,
+        ClaudeBackend(),
+        system_prompt=opts.pop("system_prompt", None),
+        run_options=RunOptions(binary=str(fake), **opts),
+        out=out if out is not None else io.StringIO(),
+    )
+
+
 def _run(scenario: str, fake: Path, project: Path):
     os.environ["FAKE_CLAUDE_SCENARIO"] = scenario
     try:
-        return run_claude(
-            "do the thing",
-            project,
-            claude_bin=str(fake),
-            out=io.StringIO(),
-        )
+        return _run_agent(project, fake)
     finally:
         os.environ.pop("FAKE_CLAUDE_SCENARIO", None)
 
@@ -146,12 +159,7 @@ def test_terminal_text_is_streamed_to_out(fake_claude: Path, project_dir: Path):
     os.environ["FAKE_CLAUDE_SCENARIO"] = "completed"
     sink = io.StringIO()
     try:
-        run_claude(
-            "do the thing",
-            project_dir,
-            claude_bin=str(fake_claude),
-            out=sink,
-        )
+        _run_agent(project_dir, fake_claude, out=sink)
     finally:
         os.environ.pop("FAKE_CLAUDE_SCENARIO", None)
     output = sink.getvalue()
@@ -167,13 +175,7 @@ def test_system_prompt_passed_as_append_flag(fake_claude: Path, project_dir: Pat
     os.environ["FAKE_CLAUDE_SCENARIO"] = "echo_args"
     os.environ["ODIN_ARGS_FILE"] = str(args_file)
     try:
-        run_claude(
-            "do the thing",
-            project_dir,
-            claude_bin=str(fake_claude),
-            system_prompt="CONTRACT-TEXT",
-            out=io.StringIO(),
-        )
+        _run_agent(project_dir, fake_claude, system_prompt="CONTRACT-TEXT")
     finally:
         os.environ.pop("FAKE_CLAUDE_SCENARIO", None)
         os.environ.pop("ODIN_ARGS_FILE", None)
@@ -187,10 +189,7 @@ def test_disallowed_tools_and_default_permission_mode_passed(fake_claude: Path, 
     os.environ["FAKE_CLAUDE_SCENARIO"] = "echo_args"
     os.environ["ODIN_ARGS_FILE"] = str(args_file)
     try:
-        run_claude(
-            "x", project_dir, claude_bin=str(fake_claude),
-            disallowed_tools=["Bash(rm:*)", "WebFetch"], out=io.StringIO(),
-        )
+        _run_agent(project_dir, fake_claude, disallowed_tools=["Bash(rm:*)", "WebFetch"])
     finally:
         os.environ.pop("FAKE_CLAUDE_SCENARIO", None)
         os.environ.pop("ODIN_ARGS_FILE", None)
@@ -207,7 +206,7 @@ def test_no_system_prompt_flag_when_absent(fake_claude: Path, project_dir: Path,
     os.environ["FAKE_CLAUDE_SCENARIO"] = "echo_args"
     os.environ["ODIN_ARGS_FILE"] = str(args_file)
     try:
-        run_claude("x", project_dir, claude_bin=str(fake_claude), out=io.StringIO())
+        _run_agent(project_dir, fake_claude)
     finally:
         os.environ.pop("FAKE_CLAUDE_SCENARIO", None)
         os.environ.pop("ODIN_ARGS_FILE", None)
@@ -247,9 +246,9 @@ def test_max_turns_flag_omitted_by_default_and_added_when_set(fake_claude: Path,
     os.environ["FAKE_CLAUDE_SCENARIO"] = "echo_args"
     os.environ["ODIN_ARGS_FILE"] = str(args_file)
     try:
-        run_claude("x", project_dir, claude_bin=str(fake_claude), out=io.StringIO())
+        _run_agent(project_dir, fake_claude)
         assert "--max-turns" not in args_file.read_text().splitlines()
-        run_claude("x", project_dir, claude_bin=str(fake_claude), max_turns=200, out=io.StringIO())
+        _run_agent(project_dir, fake_claude, max_turns=200)
         argv = args_file.read_text().splitlines()
         assert "--max-turns" in argv and "200" in argv
     finally:
@@ -374,9 +373,4 @@ def test_render_agent_text_keeps_code_fences_and_bolds_on_tty():
 
 def test_missing_project_dir_raises(fake_claude: Path, tmp_path: Path):
     with pytest.raises(FileNotFoundError):
-        run_claude(
-            "x",
-            tmp_path / "nope",
-            claude_bin=str(fake_claude),
-            out=io.StringIO(),
-        )
+        _run_agent(tmp_path / "nope", fake_claude)
