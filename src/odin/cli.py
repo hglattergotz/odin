@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TextIO
 
 from . import __version__, completed, config, git, metrics, style, term
-from .backends.registry import available_platforms
+from .backends.registry import available_platforms, get_backend
 from .contract import build_system_prompt
 from .demo import DemoError, DemoExists, create_demo
 from .guide import TOPICS, render as render_guide
@@ -30,7 +30,7 @@ from .protocol import (
     FollowUp, Outcome, Question, parse, parse_follow_ups, parse_questions, unwrap_fence,
 )
 from .queue import Queue, Task, archive_finished_subqueues, archived_subqueues
-from .backends import ClaudeBackend, RunOptions
+from .backends import RunOptions
 from .runner import RunResult, run_agent
 
 
@@ -157,6 +157,18 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--claude-bin", default="claude",
         help="path to the claude CLI (default: claude on PATH)",
+    )
+    run.add_argument(
+        "--platform", default=None,
+        help="agent platform to run tasks through (resolution: this flag → "
+             "$ODIN_PLATFORM → default_platform in config → claude). Only "
+             "'claude' is implemented today; other names error clearly.",
+    )
+    run.add_argument(
+        "--model", default=None,
+        help="model passed to the agent CLI as --model (resolution: this flag → "
+             "$ODIN_MODEL → platforms.<platform>.model in config → unset). "
+             "Unset emits no --model, i.e. the platform CLI's own default.",
     )
     run.add_argument(
         "--branch", default=None,
@@ -366,6 +378,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if args.disallowed_tools else None
     )
 
+    # Resolve the agent platform + model (CLI flag → env → config → fallback)
+    # and pick the backend. Resolved before the dry-run branch so an unknown
+    # `--platform` fails loudly even on a dry run. Today only ClaudeBackend is
+    # registered; an unknown name (e.g. `--platform cursor`, not yet wired) is a
+    # hard error from the registry, not a silent fallback to claude.
+    platform = config.resolve_platform(args.platform)
+    model = config.resolve_model(args.model, platform=platform)
+    try:
+        backend = get_backend(platform)
+    except ValueError as e:
+        print(f"odin: {e}", file=sys.stderr)
+        return 2
+
     # Startup git setup: clean-tree check + select/create the one branch the
     # whole queue lands on. Skipped on --dry-run and for non-git projects.
     if args.dry_run:
@@ -401,7 +426,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     try:
         exit_code = _run_loop(
             args, project, q, allowed, disallowed, system_prompt, acc, signals,
-            branch=branch,
+            backend, model=model, branch=branch,
         )
     finally:
         acc.finish(exit_code)
@@ -617,6 +642,8 @@ def _run_loop(
     system_prompt: str,
     acc: metrics.RunAccumulator,
     signals: Signals,
+    backend=None,
+    model: str | None = None,
     branch: str | None = None,
     out: TextIO = sys.stdout,
 ) -> int:
@@ -655,10 +682,11 @@ def _run_loop(
         result = run_agent(
             prompt,
             project,
-            ClaudeBackend(),
+            backend,
             system_prompt=system_prompt,
             run_options=RunOptions(
                 binary=args.claude_bin,
+                model=model,
                 permission_mode=args.permission_mode,
                 allowed_tools=allowed or [],
                 disallowed_tools=disallowed or [],

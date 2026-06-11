@@ -342,6 +342,104 @@ def test_dry_run_prints_prompt_and_does_not_invoke(setup, capsys):
 
 
 # ----------------------------------------------------------------------
+# platform / model selection (Batch A4)
+# ----------------------------------------------------------------------
+
+def test_run_platform_claude_behaves_identically(setup, monkeypatch):
+    """`--platform claude` is the default path — same outcome as no flag."""
+    monkeypatch.delenv("ODIN_PLATFORM", raising=False)
+    monkeypatch.delenv("ODIN_MODEL", raising=False)
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "claude", "--claude-bin", str(fake)],
+        scenario="completed",
+    )
+    assert rc == 0
+    assert (qdir / "done" / "001-a.md").exists()
+
+
+def _arg_recorder(path: Path, log: Path) -> Path:
+    """A fake claude that records its argv to `log`, then emits a completed result."""
+    result = (
+        '{"type":"result","subtype":"success","stop_reason":"end_turn",'
+        '"is_error":false,"result":"<<<NEXT_CONTEXT>>>\\ndone\\n<<<END>>>"}'
+    )
+    path.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$@" > "{log}"\n'
+        "cat >/dev/null\n"
+        f"printf '%s\\n' '{result}'\n"
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def test_run_model_flag_passed_to_claude(setup, tmp_path, monkeypatch):
+    monkeypatch.delenv("ODIN_MODEL", raising=False)
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    rec = _arg_recorder(tmp_path / "recorder.sh", log)
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--claude-bin", str(rec), "--model", "claude-test-model"],
+    )
+    assert rc == 0
+    logged = log.read_text().splitlines()
+    assert "--model" in logged
+    assert "claude-test-model" in logged
+
+
+def test_run_no_model_emits_no_model_flag(setup, tmp_path, monkeypatch):
+    monkeypatch.delenv("ODIN_MODEL", raising=False)
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    rec = _arg_recorder(tmp_path / "recorder.sh", log)
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(rec)],
+    )
+    assert rc == 0
+    assert "--model" not in log.read_text().splitlines()
+
+
+def test_run_unknown_platform_errors_clearly(setup, capsys, monkeypatch):
+    """`--platform cursor` is not wired yet (deferred to B1) — hard error, no run."""
+    monkeypatch.delenv("ODIN_PLATFORM", raising=False)
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--claude-bin", str(fake)],
+        scenario="completed",
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "unknown platform" in err
+    assert "cursor" in err
+    # Nothing ran — the task is untouched in pending/.
+    assert (qdir / "pending" / "001-a.md").exists()
+
+
+def test_run_model_from_env(setup, tmp_path, monkeypatch):
+    """$ODIN_MODEL supplies the model when no --model flag is given."""
+    monkeypatch.setenv("ODIN_MODEL", "env-model-id")
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    rec = _arg_recorder(tmp_path / "recorder.sh", log)
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(rec)],
+    )
+    assert rc == 0
+    logged = log.read_text().splitlines()
+    assert "--model" in logged
+    assert "env-model-id" in logged
+
+
+# ----------------------------------------------------------------------
 # git startup
 # ----------------------------------------------------------------------
 
