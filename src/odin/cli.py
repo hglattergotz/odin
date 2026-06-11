@@ -16,13 +16,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-from . import __version__, completed, git, metrics, style, term
+from . import __version__, completed, config, git, metrics, style, term
+from .backends.registry import available_platforms
 from .contract import build_system_prompt
 from .demo import DemoError, DemoExists, create_demo
 from .guide import TOPICS, render as render_guide
 from .lint import scan_claude_md
 from .prompts import (
-    BranchPlan, ask_branch_choice, ask_continue, ask_questions, render_questions,
+    BranchPlan, ask_branch_choice, ask_config, ask_continue, ask_questions,
+    render_questions,
 )
 from .protocol import (
     FollowUp, Outcome, Question, parse, parse_follow_ups, parse_questions, unwrap_fence,
@@ -105,7 +107,7 @@ def _build_parser() -> argparse.ArgumentParser:
         version=f"odin {__version__} (from {_pkg_dir})",
     )
     sub = p.add_subparsers(
-        dest="cmd", metavar="{run,status,resume,demo,guide,archive,metrics}"
+        dest="cmd", metavar="{run,status,resume,demo,guide,archive,metrics,config}"
     )
 
     run = sub.add_parser(
@@ -296,6 +298,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="metrics events file to read (default: ~/.odin/metrics/events.jsonl)",
     )
     mt.set_defaults(func=_cmd_metrics)
+
+    cf = sub.add_parser(
+        "config",
+        help="view or edit the user config (~/.odin/config.toml)",
+        description=(
+            "View or edit Odin's user config (default ~/.odin/config.toml, "
+            "$ODIN_CONFIG overrides). With no action, opens an interactive "
+            "menu on a TTY to set the default platform and per-platform model. "
+            "`show` prints the effective config; `get KEY` / `set KEY VALUE` "
+            "read or write a dotted key (e.g. platforms.claude.model). This is "
+            "the ONLY command that writes the config — `odin run` never does."
+        ),
+    )
+    cf.add_argument(
+        "action", nargs="?", choices=["show", "get", "set"], default=None,
+        help="show | get KEY | set KEY VALUE (omit for the interactive menu)",
+    )
+    cf.add_argument(
+        "params", nargs="*", metavar="ARG",
+        help="KEY for get; KEY VALUE for set",
+    )
+    cf.set_defaults(func=_cmd_config)
 
     return p
 
@@ -1132,6 +1156,84 @@ def _cmd_demo(args: argparse.Namespace) -> int:
 
 def _cmd_guide(args: argparse.Namespace) -> int:
     print(render_guide(args.topic), end="")
+    return 0
+
+
+# ----------------------------------------------------------------------
+# config
+# ----------------------------------------------------------------------
+
+def _cmd_config(args: argparse.Namespace) -> int:
+    action = args.action
+    params = list(args.params)
+    path = config.config_path()
+
+    if action == "show":
+        return _config_show(path)
+    if action == "get":
+        if len(params) != 1:
+            print("odin: usage: odin config get KEY", file=sys.stderr)
+            return 2
+        return _config_get(path, params[0])
+    if action == "set":
+        if len(params) != 2:
+            print("odin: usage: odin config set KEY VALUE", file=sys.stderr)
+            return 2
+        return _config_set(path, params[0], params[1])
+
+    # No action — interactive menu (TTY only).
+    if not sys.stdin.isatty():
+        print(
+            "odin: `odin config` is interactive; on a non-TTY use "
+            "`odin config set KEY VALUE` / `get` / `show`.",
+            file=sys.stderr,
+        )
+        return 2
+    cfg = config.load_config(path)
+    cfg = ask_config(
+        cfg,
+        platforms=available_platforms(),
+        suggestions=config.MODEL_SUGGESTIONS,
+    )
+    saved = config.save_config(cfg, path)
+    print(f"odin: wrote {saved}")
+    return 0
+
+
+def _config_show(path: Path) -> int:
+    cfg = config.load_config(path)
+    exists = path.exists()
+    print(f"# {path}{'' if exists else '  (does not exist yet)'}")
+    body = config.dump_toml(cfg)
+    print(body if body.strip() else "# (empty)")
+    # Effective resolution (factors in env vars), for orientation.
+    platform = config.resolve_platform(config=cfg)
+    model = config.resolve_model(platform=platform, config=cfg)
+    print(f"# effective platform: {platform}")
+    print(f"# effective model:    {model if model else '(platform default)'}")
+    return 0
+
+
+def _config_get(path: Path, key: str) -> int:
+    cfg = config.load_config(path)
+    value = config.get_in(cfg, key)
+    if value is None:
+        print(f"odin: key not set: {key}", file=sys.stderr)
+        return 1
+    if isinstance(value, dict):
+        print(config.dump_toml(value), end="")
+    elif isinstance(value, bool):
+        print("true" if value else "false")
+    else:
+        print(value)
+    return 0
+
+
+def _config_set(path: Path, key: str, raw_value: str) -> int:
+    cfg = config.load_config(path)
+    config.set_in(cfg, key, config.parse_value(raw_value))
+    saved = config.save_config(cfg, path)
+    print(f"odin: set {key} = {config.get_in(cfg, key)!r} -> {saved}")
     return 0
 
 

@@ -255,7 +255,7 @@ def test_no_subcommand_prints_help_not_error(capsys):
     # The overview explains what the queue is and what the input looks like.
     assert "queue/<name>/pending/" in out
     assert "NNN-slug.md" in out
-    assert "{run,status,resume,demo,guide,archive,metrics}" in out
+    assert "{run,status,resume,demo,guide,archive,metrics,config}" in out
 
 
 def test_status_lists_each_section(setup, capsys):
@@ -701,3 +701,50 @@ def test_run_on_container_errors_without_creating(setup, tmp_path, capsys):
     assert rc == 2
     assert "holds sub-queues" in capsys.readouterr().err
     assert not (container / "pending").exists()
+
+
+# ----- odin config ---------------------------------------------------
+
+def test_config_set_get_round_trip(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "config.toml"
+    monkeypatch.setenv("ODIN_CONFIG", str(cfg))
+    assert main(["config", "set", "platforms.claude.model", "sonnet"]) == 0
+    capsys.readouterr()
+    assert main(["config", "get", "platforms.claude.model"]) == 0
+    assert capsys.readouterr().out.strip() == "sonnet"
+    assert cfg.read_text() == (
+        "[platforms.claude]\n"
+        'model = "sonnet"\n'
+    )
+
+
+def test_config_get_missing_key_returns_1(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ODIN_CONFIG", str(tmp_path / "config.toml"))
+    assert main(["config", "get", "platforms.claude.model"]) == 1
+    assert "key not set" in capsys.readouterr().err
+
+
+def test_config_show_includes_effective(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "config.toml"
+    monkeypatch.setenv("ODIN_CONFIG", str(cfg))
+    monkeypatch.delenv("ODIN_PLATFORM", raising=False)
+    monkeypatch.delenv("ODIN_MODEL", raising=False)
+    main(["config", "set", "default_platform", "claude"])
+    capsys.readouterr()
+    assert main(["config", "show"]) == 0
+    out = capsys.readouterr().out
+    assert "effective platform: claude" in out
+    assert "effective model:    (platform default)" in out
+
+
+def test_config_set_coerces_bool(tmp_path, monkeypatch):
+    cfg = tmp_path / "config.toml"
+    monkeypatch.setenv("ODIN_CONFIG", str(cfg))
+    main(["config", "set", "platforms.claude.verbose", "true"])
+    assert "verbose = true" in cfg.read_text()
+
+
+def test_config_get_usage_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ODIN_CONFIG", str(tmp_path / "config.toml"))
+    assert main(["config", "get"]) == 2
+    assert "usage" in capsys.readouterr().err

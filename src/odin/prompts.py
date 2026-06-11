@@ -173,6 +173,113 @@ def _format_option(opt) -> str:
 
 
 # ----------------------------------------------------------------------
+# config setter (interactive)
+# ----------------------------------------------------------------------
+
+def ask_config(
+    config: dict,
+    *,
+    platforms: list[str],
+    suggestions: dict[str, list[str]] | None = None,
+    in_: TextIO | None = None,
+    out: TextIO | None = None,
+) -> dict:
+    """Interactive editor for `~/.odin/config.toml`; returns the updated config.
+
+    A small menu loop: set the default platform, or set/unset the model for a
+    platform. Mutates and returns `config` (the caller persists it). EOF/empty
+    at the top menu exits. Reuses the same low-level IO as the branch selector.
+    """
+    in_ = in_ or sys.stdin
+    out = out or sys.stdout
+    suggestions = suggestions or {}
+    color = _use_color(out)
+
+    out.write(f"\n{_yellow('Odin configuration', color)}\n")
+    while True:
+        cur_default = config.get("default_platform") or "(unset)"
+        out.write("\n")
+        out.write(f"  [1] Default platform (current: {cur_default})\n")
+        out.write("  [2] Set model for a platform\n")
+        out.write("  [3] Done\n")
+        out.flush()
+        choice = _readline(in_, out, "\n  Choose 1/2/3 [default: 3]: ")
+        if choice in (None, "", "3"):
+            return config
+        if choice == "1":
+            picked = _pick_from_list(
+                "Default platform", platforms, config.get("default_platform"), in_, out
+            )
+            if picked:
+                config["default_platform"] = picked
+        elif choice == "2":
+            platform = _pick_from_list(
+                "Which platform to set a model for", platforms, None, in_, out
+            )
+            if platform:
+                _set_model(config, platform, suggestions.get(platform, []), in_, out)
+        else:
+            out.write("  Please enter 1, 2, or 3.\n")
+
+
+def _pick_from_list(
+    label: str, items: list[str], current: str | None, in_: TextIO, out: TextIO
+) -> str | None:
+    """Numbered pick from `items` (empty = keep current/skip). Returns the value."""
+    if not items:
+        out.write(f"  No {label.lower()} available.\n")
+        return None
+    out.write(f"\n  {label}:\n")
+    for i, item in enumerate(items, 1):
+        mark = "  (current)" if item == current else ""
+        out.write(f"    [{i}] {item}{mark}\n")
+    out.flush()
+    while True:
+        raw = _readline(in_, out, "    Choose a number (empty = keep): ")
+        if raw in (None, ""):
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(items):
+            return items[int(raw) - 1]
+        out.write(f"    Please enter 1-{len(items)}.\n")
+
+
+def _set_model(
+    config: dict, platform: str, suggested: list[str], in_: TextIO, out: TextIO
+) -> None:
+    """Model picker: curated suggestions + Other (free text) + Use default (unset)."""
+    section = config.setdefault("platforms", {}).setdefault(platform, {})
+    current = section.get("model")
+    out.write(f"\n  Model for {platform}")
+    out.write(f" (current: {current})\n" if current else " (current: platform default)\n")
+    for i, model in enumerate(suggested, 1):
+        mark = "  (current)" if model == current else ""
+        out.write(f"    [{i}] {model}{mark}\n")
+    other = len(suggested) + 1
+    unset = len(suggested) + 2
+    out.write(f"    [{other}] Other (type a value)\n")
+    out.write(f"    [{unset}] Use platform default (unset)\n")
+    out.flush()
+    while True:
+        raw = _readline(in_, out, "    Choose a number (empty = keep): ")
+        if raw in (None, ""):
+            return
+        if raw.isdigit():
+            n = int(raw)
+            if 1 <= n <= len(suggested):
+                section["model"] = suggested[n - 1]
+                return
+            if n == other:
+                val = _readline(in_, out, "    Model value: ")
+                if val:
+                    section["model"] = val
+                return
+            if n == unset:
+                section.pop("model", None)
+                return
+        out.write(f"    Please enter 1-{unset}.\n")
+
+
+# ----------------------------------------------------------------------
 # low-level IO
 # ----------------------------------------------------------------------
 
