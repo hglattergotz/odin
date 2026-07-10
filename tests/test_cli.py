@@ -6,6 +6,7 @@ import io
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -701,3 +702,16 @@ def test_run_on_container_errors_without_creating(setup, tmp_path, capsys):
     assert rc == 2
     assert "holds sub-queues" in capsys.readouterr().err
     assert not (container / "pending").exists()
+
+
+def test_module_entry_point_runs_from_source(tmp_path):
+    """`python -m odin` works via odin/__main__.py, so Odin runs from a source
+    checkout with no install (`PYTHONPATH=src python -m odin …`)."""
+    src = Path(__file__).resolve().parent.parent / "src"
+    env = {**os.environ, "PYTHONPATH": str(src)}
+    result = subprocess.run(
+        [sys.executable, "-m", "odin", "guide"],
+        capture_output=True, text=True, env=env, cwd=str(tmp_path),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Authoring tasks for Odin" in result.stdout

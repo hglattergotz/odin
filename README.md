@@ -143,6 +143,12 @@ uv run pytest    # tests
 uv run odin -h   # run the live source without installing
 ```
 
+Or run straight from a source checkout with no uv and no install (stdlib only):
+
+```sh
+PYTHONPATH=src python -m odin -h
+```
+
 Stdlib only at runtime; dev tools are pinned and locked with a 14-day minimum
 package age (`tool.uv.exclude-newer`). See [CLAUDE.md](CLAUDE.md) for the full
 contributor and supply-chain rules.

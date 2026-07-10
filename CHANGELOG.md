@@ -5,6 +5,15 @@ All notable changes to Odin are documented here. The format roughly follows
 [SemVer](https://semver.org/). Releases are git tags (`vX.Y.Z`); install one
 with `uv tool install --from 'git+https://github.com/hglattergotz/odin@vX.Y.Z' odin`.
 
+## [Unreleased]
+
+### Added
+- `python -m odin` — a module entry point (`odin/__main__.py`) so Odin runs
+  straight from a source checkout with no install
+  (`PYTHONPATH=src python -m odin …`), alongside the existing `odin` console
+  script. Lets downstream tooling depend on the maintained source instead of
+  packaging or vendoring a copy.
+
 ## [0.2.2] — 2026-06-06
 
 ### Added
