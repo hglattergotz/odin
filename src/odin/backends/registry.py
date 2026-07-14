@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from odin.backends.base import AgentBackend
 from odin.backends.claude import ClaudeBackend
+from odin.backends.cursor import CursorBackend
 
 #: The default platform when none is specified — preserves today's behaviour.
 DEFAULT_PLATFORM = "claude"
@@ -19,6 +20,7 @@ DEFAULT_PLATFORM = "claude"
 # fresh backend and registration stays cheap to import.
 _BACKENDS: dict[str, type[AgentBackend]] = {
     "claude": ClaudeBackend,
+    "cursor": CursorBackend,
 }
 
 

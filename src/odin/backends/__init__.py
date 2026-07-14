@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from odin.backends.base import AgentBackend, AgentInvokeSpec, CapturedFields, RunOptions
 from odin.backends.claude import ClaudeBackend
+from odin.backends.cursor import CursorBackend
 from odin.backends.registry import get_backend
 
 __all__ = [
@@ -23,5 +24,6 @@ __all__ = [
     "CapturedFields",
     "RunOptions",
     "ClaudeBackend",
+    "CursorBackend",
     "get_backend",
 ]

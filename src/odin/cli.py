@@ -380,9 +380,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     # Resolve the agent platform + model (CLI flag → env → config → fallback)
     # and pick the backend. Resolved before the dry-run branch so an unknown
-    # `--platform` fails loudly even on a dry run. Today only ClaudeBackend is
-    # registered; an unknown name (e.g. `--platform cursor`, not yet wired) is a
-    # hard error from the registry, not a silent fallback to claude.
+    # `--platform` fails loudly even on a dry run. An unknown name (a typo, or
+    # a platform not yet wired) is a hard error from the registry, not a
+    # silent fallback to claude.
     platform = config.resolve_platform(args.platform)
     model = config.resolve_model(args.model, platform=platform)
     try:
@@ -650,6 +650,11 @@ def _run_loop(
     """The task-processing loop. Records each task into `acc` and returns the
     process exit code; the caller writes the run summary."""
     completed = 0
+    # `--claude-bin` maps to the claude binary only (proposal §3 flag table);
+    # other platforms fall back to their config/default binary until
+    # `--agent-bin` lands (B4). getattr default keeps backend=None (tests with
+    # run_agent mocked) on the historical claude path.
+    binary = args.claude_bin if getattr(backend, "name", "claude") == "claude" else None
     # Planned total, computed once: tasks left + tasks already done this run.
     sig = _Signaler(signals, out, q.root.name, total=completed + len(q.pending()))
     while True:
@@ -685,7 +690,7 @@ def _run_loop(
             backend,
             system_prompt=system_prompt,
             run_options=RunOptions(
-                binary=args.claude_bin,
+                binary=binary,
                 model=model,
                 permission_mode=args.permission_mode,
                 allowed_tools=allowed or [],

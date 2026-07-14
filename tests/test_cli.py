@@ -406,19 +406,19 @@ def test_run_no_model_emits_no_model_flag(setup, tmp_path, monkeypatch):
 
 
 def test_run_unknown_platform_errors_clearly(setup, capsys, monkeypatch):
-    """`--platform cursor` is not wired yet (deferred to B1) — hard error, no run."""
+    """An unregistered `--platform` is a hard error before anything runs."""
     monkeypatch.delenv("ODIN_PLATFORM", raising=False)
     project, qdir, fake = setup
     _seed_task(qdir, "001-a.md")
     rc = _run_cli(
         ["run", str(qdir), "--project", str(project),
-         "--platform", "cursor", "--claude-bin", str(fake)],
+         "--platform", "kiro", "--claude-bin", str(fake)],
         scenario="completed",
     )
     assert rc == 2
     err = capsys.readouterr().err
     assert "unknown platform" in err
-    assert "cursor" in err
+    assert "kiro" in err
     # Nothing ran — the task is untouched in pending/.
     assert (qdir / "pending" / "001-a.md").exists()
 
@@ -437,6 +437,67 @@ def test_run_model_from_env(setup, tmp_path, monkeypatch):
     logged = log.read_text().splitlines()
     assert "--model" in logged
     assert "env-model-id" in logged
+
+
+# ----------------------------------------------------------------------
+# --platform cursor wiring (Batch B1–B2)
+# ----------------------------------------------------------------------
+
+def _cursor_recorder(path: Path, log: Path, stdin_log: Path) -> Path:
+    """A fake `agent` that records argv + stdin, then emits a Cursor-shaped
+    terminal result (no stop_reason, camelCase usage) with a completed sentinel."""
+    result = (
+        '{"type":"result","subtype":"success","duration_ms":7,'
+        '"duration_api_ms":6,"is_error":false,'
+        '"result":"<<<NEXT_CONTEXT>>>\\ncursor carry\\n<<<END>>>",'
+        '"session_id":"sess-cursor","usage":{"inputTokens":11,"outputTokens":2,'
+        '"cacheReadTokens":3,"cacheWriteTokens":4}}'
+    )
+    path.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$@" > "{log}"\n'
+        f'cat > "{stdin_log}"\n'
+        f"printf '%s\\n' '{result}'\n"
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def test_run_platform_cursor_end_to_end(setup, tmp_path, monkeypatch):
+    """`--platform cursor` drives the agent CLI: cursor argv, protocol on
+    stdin (not a flag), --claude-bin ignored, and the task lands in done/."""
+    monkeypatch.delenv("ODIN_PLATFORM", raising=False)
+    monkeypatch.delenv("ODIN_MODEL", raising=False)
+    monkeypatch.delenv("ODIN_CONFIG", raising=False)
+    project, qdir, fake = setup
+    log = tmp_path / "argv.log"
+    stdin_log = tmp_path / "stdin.log"
+    rec = _cursor_recorder(tmp_path / "fake-agent.sh", log, stdin_log)
+    # No --agent-bin yet (Batch B4) — the binary comes from config.
+    home = Path(os.environ["ODIN_HOME"])
+    (home / "config.toml").write_text(
+        f'[platforms.cursor]\nbinary = "{rec}"\n', encoding="utf-8"
+    )
+    _seed_task(qdir, "001-a.md", "the cursor task body")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--claude-bin", str(fake)],
+    )
+    assert rc == 0
+    assert (qdir / "done" / "001-a.md").exists()
+    assert "cursor carry" in (qdir / "carry" / "001-a.next-context.md").read_text()
+    logged = log.read_text().splitlines()
+    assert "-p" in logged
+    assert "--force" in logged and "--trust" in logged
+    assert logged[logged.index("--workspace") + 1] == str(project)
+    # Protocol goes in via stdin prepend, never a flag; claude flags are absent.
+    for flag in ("--append-system-prompt", "--permission-mode", "--verbose"):
+        assert flag not in logged
+    stdin = stdin_log.read_text()
+    assert stdin.startswith("<!-- ODIN_PROTOCOL")
+    assert "<!-- END ODIN_PROTOCOL -->" in stdin
+    assert "the cursor task body" in stdin
+    assert stdin.index("END ODIN_PROTOCOL") < stdin.index("the cursor task body")
 
 
 # ----------------------------------------------------------------------
