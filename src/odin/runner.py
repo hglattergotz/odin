@@ -282,6 +282,17 @@ def _tool_detail(name: str, inp: object, project_dir: Path | None = None) -> str
     return _truncate(collapsed, is_path=is_path)
 
 
+def _write_tool_line(out: TextIO, name: str, detail: str) -> None:
+    """One indented activity line per tool call — `   → Name  detail`.
+
+    Shared by every backend so tool activity looks identical across platforms.
+    """
+    line = "   " + style.tool(f"{style.GLYPH_ARROW} {name}", out)
+    if detail:
+        line += "  " + style.dim(detail, out)
+    _safe_write(out, line + "\n")
+
+
 def _abbrev_path(val: str, project_dir: Path | None) -> str:
     """Show a path relative to the project dir (or `~`) when possible."""
     try:

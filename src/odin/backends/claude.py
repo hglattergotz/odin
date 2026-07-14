@@ -28,6 +28,7 @@ from odin.runner import (
     _safe_write,
     _short_session,
     _tool_calls,
+    _write_tool_line,
 )
 
 #: Claude stop reasons that count as a clean, complete turn.
@@ -106,10 +107,7 @@ class ClaudeBackend(AgentBackend):
                 if not rendered.endswith("\n"):
                     _safe_write(out, "\n")
             for name, detail in _tool_calls(event, project_dir):
-                line = "   " + style.tool(f"{style.GLYPH_ARROW} {name}", out)
-                if detail:
-                    line += "  " + style.dim(detail, out)
-                _safe_write(out, line + "\n")
+                _write_tool_line(out, name, detail)
             return None
 
         if etype == "user":

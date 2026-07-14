@@ -28,10 +28,13 @@ from odin import style
 from odin.backends.base import AgentBackend, AgentInvokeSpec, CapturedFields, RunOptions
 from odin.runner import (
     RunResult,
+    _abbrev_path,
     _assistant_text,
     _render_agent_text,
     _safe_write,
     _short_session,
+    _truncate,
+    _write_tool_line,
 )
 
 #: Delimiters framing the injected protocol at the top of the stdin prompt
@@ -41,6 +44,51 @@ PROTOCOL_HEADER = (
     "and git policy) -->"
 )
 PROTOCOL_FOOTER = "<!-- END ODIN_PROTOCOL -->"
+
+
+# Per Cursor tool_call kind: (display name, args key worth showing, is_path).
+# Mirrors runner._TOOL_ARG so a Cursor run's tool lines read like a Claude run's.
+_TOOL_KINDS = {
+    "readToolCall": ("Read", "path", True),
+    "editToolCall": ("Edit", "path", True),
+    "writeToolCall": ("Write", "path", True),
+    "shellToolCall": ("Shell", "command", False),
+}
+_TOOL_KIND_SUFFIX = "ToolCall"
+
+
+def _tool_call_summary(
+    event: dict, project_dir: Path | None = None
+) -> tuple[str, str] | None:
+    """(name, detail) for a Cursor `tool_call` event, or None if unrecognisable.
+
+    The payload nests the kind as a single wrapper key —
+    `{"tool_call": {"readToolCall": {"args": {"path": …}}}}`. Unknown kinds
+    still render (`grepToolCall` → `Grep`) with the first string arg as detail,
+    so new Cursor tools degrade to a generic line rather than silence.
+    """
+    payload = event.get("tool_call")
+    if not isinstance(payload, dict):
+        return None
+    for kind, body in payload.items():
+        if not (isinstance(kind, str) and kind.endswith(_TOOL_KIND_SUFFIX)):
+            continue
+        stem = kind[: -len(_TOOL_KIND_SUFFIX)]
+        name, key, is_path = _TOOL_KINDS.get(kind) or (stem.capitalize() or "?", None, False)
+        args = body.get("args") if isinstance(body, dict) else None
+        detail = ""
+        if isinstance(args, dict):
+            val = args.get(key) if key else None
+            if not isinstance(val, str) or not val.strip():
+                val = next(
+                    (v for v in args.values() if isinstance(v, str) and v.strip()), ""
+                )
+                is_path = False
+            if is_path:
+                val = _abbrev_path(val, project_dir)
+            detail = _truncate(" ".join(val.split()), is_path=is_path)
+        return name, detail
+    return None
 
 
 def _norm_usage(raw: object) -> dict | None:
@@ -126,11 +174,19 @@ class CursorBackend(AgentBackend):
         """Render one Cursor NDJSON event live; return captured fields or None.
 
         Init and assistant events share Claude's shape (proposal §6), so the
-        rendering matches ClaudeBackend. Cursor's `thinking` events stay off
-        the terminal; `tool_call` rendering lands in a later batch (B3) — runs
-        work without it, the output is just quieter.
+        rendering matches ClaudeBackend. `tool_call` activity gets one line per
+        call, written on `started` (the `completed` half stays quiet, mirroring
+        Claude's silent tool results). Cursor's `thinking` events stay off the
+        terminal (proposal §6 field table).
         """
         etype = event.get("type")
+
+        if etype == "tool_call":
+            if event.get("subtype") == "started":
+                summary = _tool_call_summary(event, project_dir)
+                if summary:
+                    _write_tool_line(out, *summary)
+            return None
 
         if etype == "system" and event.get("subtype") == "init":
             sid = event.get("session_id")

@@ -4,7 +4,8 @@ Covers the registry (default resolution, unknown-platform errors), the Claude
 backend (argv building, stream rendering hooks, the relocated success gate),
 and the Cursor backend (Batch B1–B2: `--workspace`/autonomy argv, protocol
 prepend instead of `--append-system-prompt`, and the pinned Cursor success
-predicate with camelCase-usage normalisation).
+predicate with camelCase-usage normalisation; Batch B3: one-line `tool_call`
+activity rendering).
 """
 
 from __future__ import annotations
@@ -323,16 +324,102 @@ def test_cursor_normalise_nonzero_exit_fails():
     assert r.succeeded is False
 
 
-def test_cursor_stream_thinking_and_tool_call_are_quiet():
+def test_cursor_stream_thinking_and_unrecognisable_tool_call_are_quiet():
     import io
 
     backend = CursorBackend()
     sink = io.StringIO()
     assert backend.handle_stream_event({"type": "thinking", "text": "hmm"}, sink) is None
+    # Empty / malformed payloads: nothing worth a line, and never a crash.
     assert backend.handle_stream_event(
         {"type": "tool_call", "subtype": "started", "tool_call": {}}, sink
     ) is None
+    assert backend.handle_stream_event(
+        {"type": "tool_call", "subtype": "started", "tool_call": "junk"}, sink
+    ) is None
+    assert backend.handle_stream_event(
+        {"type": "tool_call", "subtype": "started"}, sink
+    ) is None
     assert sink.getvalue() == ""
+
+
+def _cursor_tool_event(kind: str, args: dict, subtype: str = "started") -> dict:
+    return {
+        "type": "tool_call",
+        "subtype": subtype,
+        "call_id": "call-1",
+        "tool_call": {kind: {"args": args}},
+    }
+
+
+def test_cursor_stream_read_tool_call_renders_relative_path():
+    import io
+
+    sink = io.StringIO()
+    CursorBackend().handle_stream_event(
+        _cursor_tool_event("readToolCall", {"path": "/proj/src/app.py"}),
+        sink,
+        project_dir=Path("/proj"),
+    )
+    assert sink.getvalue() == "   → Read  src/app.py\n"
+
+
+def test_cursor_stream_edit_and_write_tool_calls_render():
+    import io
+
+    sink = io.StringIO()
+    backend = CursorBackend()
+    backend.handle_stream_event(
+        _cursor_tool_event("editToolCall", {"path": "notes.md"}), sink
+    )
+    backend.handle_stream_event(
+        _cursor_tool_event("writeToolCall", {"path": "out.txt"}), sink
+    )
+    assert sink.getvalue() == "   → Edit  notes.md\n   → Write  out.txt\n"
+
+
+def test_cursor_stream_shell_tool_call_renders_command():
+    import io
+
+    sink = io.StringIO()
+    CursorBackend().handle_stream_event(
+        _cursor_tool_event("shellToolCall", {"command": "ls  -la\n"}), sink
+    )
+    # Whitespace collapses to one line; commands are not path-abbreviated.
+    assert sink.getvalue() == "   → Shell  ls -la\n"
+
+
+def test_cursor_stream_unknown_tool_kind_degrades_to_generic_line():
+    import io
+
+    sink = io.StringIO()
+    CursorBackend().handle_stream_event(
+        _cursor_tool_event("grepToolCall", {"pattern": "TODO"}), sink
+    )
+    assert sink.getvalue() == "   → Grep  TODO\n"
+
+
+def test_cursor_stream_tool_call_completed_is_quiet():
+    import io
+
+    sink = io.StringIO()
+    CursorBackend().handle_stream_event(
+        _cursor_tool_event(
+            "shellToolCall", {"command": "ls"}, subtype="completed"
+        ),
+        sink,
+    )
+    assert sink.getvalue() == ""
+
+
+def test_cursor_stream_tool_call_without_key_arg_falls_back_to_first_string():
+    import io
+
+    sink = io.StringIO()
+    CursorBackend().handle_stream_event(
+        _cursor_tool_event("shellToolCall", {"cwd": "/tmp", "timeout": 5}), sink
+    )
+    assert sink.getvalue() == "   → Shell  /tmp\n"
 
 
 def test_cursor_stream_result_captures_fields():
