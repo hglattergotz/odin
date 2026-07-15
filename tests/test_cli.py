@@ -473,7 +473,8 @@ def test_run_platform_cursor_end_to_end(setup, tmp_path, monkeypatch):
     log = tmp_path / "argv.log"
     stdin_log = tmp_path / "stdin.log"
     rec = _cursor_recorder(tmp_path / "fake-agent.sh", log, stdin_log)
-    # No --agent-bin yet (Batch B4) — the binary comes from config.
+    # Binary supplied via config here — the --agent-bin flag path is covered
+    # in the Batch B4–B5 section below.
     home = Path(os.environ["ODIN_HOME"])
     (home / "config.toml").write_text(
         f'[platforms.cursor]\nbinary = "{rec}"\n', encoding="utf-8"
@@ -498,6 +499,134 @@ def test_run_platform_cursor_end_to_end(setup, tmp_path, monkeypatch):
     assert "<!-- END ODIN_PROTOCOL -->" in stdin
     assert "the cursor task body" in stdin
     assert stdin.index("END ODIN_PROTOCOL") < stdin.index("the cursor task body")
+
+
+# ----------------------------------------------------------------------
+# Cursor CLI flags + dry-run from build_invoke (Batch B4–B5)
+# ----------------------------------------------------------------------
+
+def _clean_platform_env(monkeypatch):
+    for var in ("ODIN_PLATFORM", "ODIN_MODEL", "ODIN_CONFIG"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_run_cursor_agent_bin_flag_end_to_end(setup, tmp_path, monkeypatch):
+    """Acceptance: --platform cursor + --agent-bin (no config needed) drives the
+    fake agent to a completed sentinel and the task lands in done/."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    stdin_log = tmp_path / "stdin.log"
+    rec = _cursor_recorder(tmp_path / "fake-agent.sh", log, stdin_log)
+    _seed_task(qdir, "001-a.md", "cursor flag task")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--agent-bin", str(rec)],
+    )
+    assert rc == 0
+    assert (qdir / "done" / "001-a.md").exists()
+    assert "cursor carry" in (qdir / "carry" / "001-a.next-context.md").read_text()
+    logged = log.read_text().splitlines()
+    # The recorder logs "$@" (no argv[0]) — it having run at all proves the
+    # --agent-bin flag picked the binary (no config supplied one).
+    assert "-p" in logged
+    assert "--force" in logged and "--trust" in logged
+
+
+def test_run_cursor_agent_bin_beats_config_binary(setup, tmp_path, monkeypatch):
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    rec = _cursor_recorder(tmp_path / "fake-agent.sh", log, tmp_path / "stdin.log")
+    home = Path(os.environ["ODIN_HOME"])
+    (home / "config.toml").write_text(
+        '[platforms.cursor]\nbinary = "/nonexistent/agent"\n', encoding="utf-8"
+    )
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--agent-bin", str(rec)],
+    )
+    assert rc == 0                 # the config binary would have crashed the run
+    assert (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_cursor_sandbox_and_approve_mcps_flags_forwarded(setup, tmp_path, monkeypatch):
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    rec = _cursor_recorder(tmp_path / "fake-agent.sh", log, tmp_path / "stdin.log")
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--agent-bin", str(rec),
+         "--force", "--trust", "--sandbox", "disabled", "--approve-mcps"],
+    )
+    assert rc == 0
+    logged = log.read_text().splitlines()
+    assert logged[logged.index("--sandbox") + 1] == "disabled"
+    assert "--approve-mcps" in logged
+    assert "--force" in logged and "--trust" in logged
+
+
+def test_run_claude_warns_and_ignores_cursor_flags(setup, tmp_path, monkeypatch, capsys):
+    """Cursor-only flags on the (default) claude platform warn once and are
+    dropped — the run proceeds and the claude argv never sees them."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    rec = _arg_recorder(tmp_path / "recorder.sh", log)
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(rec),
+         "--agent-bin", "/some/agent", "--force", "--trust",
+         "--sandbox", "disabled", "--approve-mcps"],
+    )
+    assert rc == 0
+    assert (qdir / "done" / "001-a.md").exists()
+    err = capsys.readouterr().err
+    for flag in ("--agent-bin", "--force", "--trust", "--sandbox", "--approve-mcps"):
+        assert flag in err
+    assert "ignoring" in err
+    logged = log.read_text().splitlines()
+    for flag in ("--force", "--trust", "--sandbox", "--approve-mcps"):
+        assert flag not in logged
+
+
+def test_dry_run_cursor_prints_agent_argv_not_claude(setup, monkeypatch, capsys):
+    """Dry-run sources the preview from backend.build_invoke (proposal C5)."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    _seed_task(qdir, "001-a.md", "the cursor dry body")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--platform", "cursor",
+         "--agent-bin", "/opt/cursor/agent", "--sandbox", "disabled", "--dry-run"],
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[dry-run] platform: cursor" in out
+    assert "/opt/cursor/agent" in out
+    assert "--workspace" in out and "--force" in out and "--trust" in out
+    assert "--sandbox disabled" in out
+    assert "claude" not in out.split("would invoke:")[1].splitlines()[0]
+    assert "the cursor dry body" in out
+    # Nothing moved, nothing invoked (the binary doesn't even exist).
+    assert (qdir / "pending" / "001-a.md").exists()
+
+
+def test_dry_run_claude_prints_backend_argv(setup, monkeypatch, capsys):
+    _clean_platform_env(monkeypatch)
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--claude-bin", str(fake), "--dry-run"],
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[dry-run] platform: claude" in out
+    assert str(fake) in out                     # the resolved binary, not "claude"
+    assert "--permission-mode bypassPermissions" in out
 
 
 # ----------------------------------------------------------------------

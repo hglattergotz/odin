@@ -1,8 +1,8 @@
-"""Runner tests using a fake `claude` shell script.
+"""Runner tests using fake `claude` / `agent` shell scripts.
 
-The fake script ignores all args and emits a fixed stream-json sequence
-chosen by the FAKE_CLAUDE_SCENARIO env var. This keeps the tests fast
-and decoupled from the real Claude binary.
+Each fake script ignores all args and emits a fixed stream-json sequence
+chosen by an env var (FAKE_CLAUDE_SCENARIO / FAKE_AGENT_SCENARIO). This
+keeps the tests fast and decoupled from the real CLI binaries.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from odin.backends import ClaudeBackend, RunOptions
+from odin.backends import ClaudeBackend, CursorBackend, RunOptions
 from odin.runner import (
     _abbrev_path, _render_agent_text, _tool_detail, run_agent,
 )
@@ -374,3 +374,153 @@ def test_render_agent_text_keeps_code_fences_and_bolds_on_tty():
 def test_missing_project_dir_raises(fake_claude: Path, tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         _run_agent(tmp_path / "nope", fake_claude)
+
+
+# ----------------------------------------------------------------------
+# fake `agent` — Cursor-shaped NDJSON scenarios (Batch B5)
+# ----------------------------------------------------------------------
+#
+# Same pattern as the fake claude above: a shell script that ignores its args,
+# picks a fixed Cursor-shaped stream from FAKE_AGENT_SCENARIO, and exits. The
+# shapes mirror the proposal's empirical captures: no stop_reason / cost /
+# num_turns on the result, camelCase usage, tool_call started/completed pairs,
+# and the invalid-model failure mode (exit 1, stderr only, NO result event).
+
+FAKE_AGENT_SCRIPT = r"""#!/bin/sh
+cat >/dev/null
+case "$FAKE_AGENT_SCENARIO" in
+  completed)
+    printf '%s\n' '{"type":"system","subtype":"init","session_id":"cursor-sess-1","model":"Composer","cwd":"/proj"}'
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"working on it"}]}}'
+    printf '%s\n' '{"type":"thinking","text":"quiet please"}'
+    printf '%s\n' '{"type":"tool_call","subtype":"started","call_id":"c1","tool_call":{"shellToolCall":{"args":{"command":"echo hi"}}}}'
+    printf '%s\n' '{"type":"tool_call","subtype":"completed","call_id":"c1","tool_call":{"shellToolCall":{"args":{"command":"echo hi"},"result":{"exitCode":0}}}}'
+    printf '%s\n' '{"type":"result","subtype":"success","duration_ms":42,"duration_api_ms":40,"is_error":false,"result":"All done.\n<<<NEXT_CONTEXT>>>\nDo task 2.\n<<<END>>>","session_id":"cursor-sess-1","usage":{"inputTokens":100,"outputTokens":5,"cacheReadTokens":7,"cacheWriteTokens":1}}'
+    exit 0
+    ;;
+  held)
+    printf '%s\n' '{"type":"system","subtype":"init","session_id":"cursor-sess-2"}'
+    printf '%s\n' '{"type":"result","subtype":"success","duration_ms":9,"duration_api_ms":8,"is_error":false,"result":"<<<NEEDS_INPUT>>>\nWhich db?\n<<<END>>>","session_id":"cursor-sess-2","usage":{"inputTokens":1,"outputTokens":1,"cacheReadTokens":0,"cacheWriteTokens":0}}'
+    exit 0
+    ;;
+  invalid_model)
+    # Appendix C.4: a bad --model dies before any stream — stderr + exit 1,
+    # no result event at all. Silence must classify as failure.
+    echo "Cannot use this model: nope" >&2
+    exit 1
+    ;;
+  is_error)
+    printf '%s\n' '{"type":"result","subtype":"error","duration_ms":3,"duration_api_ms":2,"is_error":true,"result":"something broke","session_id":"cursor-sess-3"}'
+    exit 0
+    ;;
+  echo_args)
+    printf '%s\n' "$@" > "$ODIN_ARGS_FILE"
+    printf '%s\n' '{"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":false,"result":"<<<NEXT_CONTEXT>>>\nok\n<<<END>>>","session_id":"cursor-sess-4"}'
+    exit 0
+    ;;
+  *)
+    echo "unknown scenario: $FAKE_AGENT_SCENARIO" >&2
+    exit 99
+    ;;
+esac
+"""
+
+
+@pytest.fixture
+def fake_agent(tmp_path: Path, monkeypatch) -> Path:
+    # CursorBackend.build_invoke reads the user config; keep the suite blind to
+    # a developer's real ODIN_CONFIG (ODIN_HOME is already isolated in conftest).
+    monkeypatch.delenv("ODIN_CONFIG", raising=False)
+    script = tmp_path / "fake-agent.sh"
+    script.write_text(FAKE_AGENT_SCRIPT)
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+def _run_cursor(project: Path, fake: Path, *, out=None, **opts):
+    """Invoke the generic loop with the Cursor backend and a fake `agent`."""
+    return run_agent(
+        "do the thing",
+        project,
+        CursorBackend(),
+        system_prompt=opts.pop("system_prompt", None),
+        run_options=RunOptions(binary=str(fake), **opts),
+        out=out if out is not None else io.StringIO(),
+    )
+
+
+def _run_agent_scenario(scenario: str, fake: Path, project: Path, *, out=None, **opts):
+    os.environ["FAKE_AGENT_SCENARIO"] = scenario
+    try:
+        return _run_cursor(project, fake, out=out, **opts)
+    finally:
+        os.environ.pop("FAKE_AGENT_SCENARIO", None)
+
+
+def test_agent_completed_scenario(fake_agent: Path, project_dir: Path):
+    r = _run_agent_scenario("completed", fake_agent, project_dir)
+    assert r.succeeded is True
+    assert r.exit_code == 0
+    assert r.platform == "cursor"
+    assert r.stop_reason is None              # never faked for Cursor
+    assert r.session_id == "cursor-sess-1"
+    assert "<<<NEXT_CONTEXT>>>" in r.final_text
+    assert r.error is None
+    assert r.usage == {"input": 100, "output": 5, "cache_read": 7, "cache_creation": 1}
+    assert r.cost_usd is None and r.num_turns is None
+    assert r.duration_ms == 42 and r.api_ms == 40
+
+
+def test_agent_stream_renders_text_and_tool_line_once(fake_agent: Path, project_dir: Path):
+    sink = io.StringIO()
+    _run_agent_scenario("completed", fake_agent, project_dir, out=sink)
+    output = sink.getvalue()
+    assert "[session cursor-s…]" in output
+    assert "working on it" in output
+    assert output.count("→ Shell  echo hi") == 1   # started renders, completed is quiet
+    assert "quiet please" not in output            # thinking stays off the terminal
+
+
+def test_agent_held_scenario(fake_agent: Path, project_dir: Path):
+    r = _run_agent_scenario("held", fake_agent, project_dir)
+    # Clean termination — the orchestrator parses NEEDS_INPUT out of final_text.
+    assert r.succeeded is True
+    assert "<<<NEEDS_INPUT>>>" in r.final_text
+
+
+def test_agent_invalid_model_no_result_event(fake_agent: Path, project_dir: Path):
+    r = _run_agent_scenario("invalid_model", fake_agent, project_dir)
+    assert r.succeeded is False
+    assert r.exit_code == 1
+    assert r.final_text == ""
+    assert "Cannot use this model" in r.error
+
+
+def test_agent_is_error_result_fails(fake_agent: Path, project_dir: Path):
+    r = _run_agent_scenario("is_error", fake_agent, project_dir)
+    assert r.succeeded is False
+    assert r.exit_code == 0                   # gate keys off is_error, not exit
+    assert r.error == "error"
+
+
+def test_agent_argv_autonomy_and_optional_flags(
+    fake_agent: Path, project_dir: Path, tmp_path: Path
+):
+    args_file = tmp_path / "agent-argv.txt"
+    os.environ["ODIN_ARGS_FILE"] = str(args_file)
+    try:
+        _run_agent_scenario(
+            "echo_args", fake_agent, project_dir,
+            model="composer-2.5", sandbox="disabled", approve_mcps=True,
+        )
+    finally:
+        os.environ.pop("ODIN_ARGS_FILE", None)
+    argv = args_file.read_text().splitlines()
+    assert "--force" in argv and "--trust" in argv
+    assert argv[argv.index("--workspace") + 1] == str(project_dir)
+    assert argv[argv.index("--model") + 1] == "composer-2.5"
+    assert argv[argv.index("--sandbox") + 1] == "disabled"
+    assert "--approve-mcps" in argv
+    # No claude-only flags leak into a cursor invocation.
+    for flag in ("--append-system-prompt", "--permission-mode", "--verbose"):
+        assert flag not in argv

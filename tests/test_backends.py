@@ -163,6 +163,9 @@ def test_run_options_defaults():
     assert opts.allowed_tools == []
     assert opts.disallowed_tools == []
     assert opts.model is None
+    # Cursor autonomy knobs are tri-state: None = not set on the CLI.
+    assert opts.sandbox is None
+    assert opts.approve_mcps is None
     # mutable defaults must not be shared across instances
     assert RunOptions().allowed_tools is not opts.allowed_tools
 
@@ -256,6 +259,32 @@ def test_cursor_config_supplies_binary_sandbox_approve_mcps(monkeypatch):
     assert spec.argv[0] == "/opt/cursor/agent"
     assert spec.argv[spec.argv.index("--sandbox") + 1] == "disabled"
     assert "--approve-mcps" in spec.argv
+
+
+def test_cursor_run_options_sandbox_and_approve_mcps_beat_config(monkeypatch):
+    # CLI flags (threaded through RunOptions, B4) win over the config section.
+    monkeypatch.delenv("ODIN_CONFIG", raising=False)
+    home = Path(os.environ["ODIN_HOME"])
+    (home / "config.toml").write_text(
+        '[platforms.cursor]\nsandbox = "enabled"\n', encoding="utf-8"
+    )
+    opts = RunOptions(sandbox="disabled", approve_mcps=True)
+    spec = CursorBackend().build_invoke("p", Path("/proj"), None, opts)
+    assert spec.argv[spec.argv.index("--sandbox") + 1] == "disabled"
+    assert "--approve-mcps" in spec.argv
+
+
+def test_cursor_run_options_none_defers_to_config(monkeypatch):
+    # Tri-state: an unset CLI flag (None) falls back to the config value.
+    monkeypatch.delenv("ODIN_CONFIG", raising=False)
+    home = Path(os.environ["ODIN_HOME"])
+    (home / "config.toml").write_text(
+        "[platforms.cursor]\napprove_mcps = true\n", encoding="utf-8"
+    )
+    opts = RunOptions(sandbox=None, approve_mcps=None)
+    spec = CursorBackend().build_invoke("p", Path("/proj"), None, opts)
+    assert "--approve-mcps" in spec.argv
+    assert "--sandbox" not in spec.argv
 
 
 def test_cursor_binary_override_beats_config(monkeypatch):

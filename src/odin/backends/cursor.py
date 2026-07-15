@@ -150,10 +150,17 @@ class CursorBackend(AgentBackend):
         ]
         if run_options.model:
             argv += ["--model", run_options.model]
-        sandbox = _cfg("sandbox")
+        # CLI flags beat the config section (proposal §3: flags win the merge).
+        # Both are tri-state on RunOptions — None means "not set on the CLI".
+        sandbox = run_options.sandbox
+        if not (isinstance(sandbox, str) and sandbox.strip()):
+            sandbox = _cfg("sandbox")
         if isinstance(sandbox, str) and sandbox.strip():
             argv += ["--sandbox", sandbox.strip()]
-        if _cfg("approve_mcps") is True:
+        approve = run_options.approve_mcps
+        if approve is None:
+            approve = _cfg("approve_mcps") is True
+        if approve:
             argv.append("--approve-mcps")
         # No system-prompt flag on this CLI — the protocol rides at the top of
         # the stdin prompt instead, framed so the agent (and anyone reading a

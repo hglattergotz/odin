@@ -52,11 +52,12 @@ class RunOptions:
     """Platform-agnostic knobs the loop hands to `build_invoke`.
 
     These mirror the keyword arguments `runner.run_claude` accepted before the
-    backend split, plus
-    `model` (the new platform-agnostic `--model`, proposal §3). A backend reads
-    only the fields meaningful to it and ignores the rest; platform-specific
-    autonomy flags (Cursor's `--force`/`--trust`/`--sandbox`) arrive in a later
-    batch. Frozen — the loop builds one per task and never mutates it.
+    backend split, plus `model` (the platform-agnostic `--model`, proposal §3)
+    and the Cursor autonomy knobs (`sandbox`/`approve_mcps`, Batch B4). A
+    backend reads only the fields meaningful to it and ignores the rest.
+    `sandbox` and `approve_mcps` are tri-state: None means "not set on the
+    CLI", letting the backend fall back to its config section. Frozen — the
+    loop builds one per run and never mutates it.
     """
 
     binary: str | None = None
@@ -65,6 +66,8 @@ class RunOptions:
     allowed_tools: list[str] = field(default_factory=list)
     disallowed_tools: list[str] = field(default_factory=list)
     max_turns: int | None = None
+    sandbox: str | None = None
+    approve_mcps: bool | None = None
 
 
 class AgentBackend(ABC):

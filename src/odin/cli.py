@@ -156,13 +156,46 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--claude-bin", default="claude",
-        help="path to the claude CLI (default: claude on PATH)",
+        help="path to the claude CLI (default: claude on PATH). Only used with "
+             "--platform claude; other platforms use --agent-bin.",
+    )
+    run.add_argument(
+        "--agent-bin", default=None,
+        help="path to the platform's agent CLI for non-claude platforms, e.g. "
+             "Cursor's `agent` (resolution: this flag → platforms.<platform>."
+             "binary in config → the platform default). Ignored (with a "
+             "warning) for --platform claude — use --claude-bin there.",
+    )
+    run.add_argument(
+        "--force", action="store_true",
+        help="(cursor) pass --force to the agent CLI. Already always on for "
+             "headless runs — a permission prompt would hang Odin — so this "
+             "flag only makes the posture explicit. Ignored on claude "
+             "(bypassPermissions covers it).",
+    )
+    run.add_argument(
+        "--trust", action="store_true",
+        help="(cursor) pass --trust to the agent CLI (trust the workspace). "
+             "Already always on for headless runs; explicit only. Ignored on "
+             "claude.",
+    )
+    run.add_argument(
+        "--sandbox", default=None, metavar="MODE",
+        help="(cursor) sandbox mode passed as --sandbox (enabled|disabled); "
+             "overrides platforms.cursor.sandbox in config. Ignored (with a "
+             "warning) on claude.",
+    )
+    run.add_argument(
+        "--approve-mcps", action="store_true", default=None,
+        help="(cursor) auto-approve MCP servers (--approve-mcps); overrides "
+             "platforms.cursor.approve_mcps in config. Ignored (with a "
+             "warning) on claude.",
     )
     run.add_argument(
         "--platform", default=None,
-        help="agent platform to run tasks through (resolution: this flag → "
-             "$ODIN_PLATFORM → default_platform in config → claude). Only "
-             "'claude' is implemented today; other names error clearly.",
+        help="agent platform to run tasks through: claude or cursor "
+             "(resolution: this flag → $ODIN_PLATFORM → default_platform in "
+             "config → claude). Unknown names error clearly.",
     )
     run.add_argument(
         "--model", default=None,
@@ -390,6 +423,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(f"odin: {e}", file=sys.stderr)
         return 2
+    _warn_ignored_platform_flags(args, platform)
 
     # Startup git setup: clean-tree check + select/create the one branch the
     # whole queue lands on. Skipped on --dry-run and for non-git projects.
@@ -441,6 +475,29 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if not args.dry_run:
             _reset_terminal(signals, q, sys.stdout)
     return exit_code
+
+
+def _warn_ignored_platform_flags(args: argparse.Namespace, platform: str) -> None:
+    """Soft-warn when a per-platform flag doesn't apply to the active platform
+    (proposal §3: warn, never a hard error — the run proceeds without it)."""
+    ignored: list[str] = []
+    if platform == "claude" and args.agent_bin:
+        ignored.append("--agent-bin")
+    if platform != "cursor":
+        if args.force:
+            ignored.append("--force")
+        if args.trust:
+            ignored.append("--trust")
+        if args.sandbox:
+            ignored.append("--sandbox")
+        if args.approve_mcps is not None:
+            ignored.append("--approve-mcps")
+    if ignored:
+        print(
+            f"odin: warning — {', '.join(ignored)} not used by platform "
+            f"'{platform}'; ignoring.",
+            file=sys.stderr,
+        )
 
 
 # ----------------------------------------------------------------------
@@ -650,11 +707,23 @@ def _run_loop(
     """The task-processing loop. Records each task into `acc` and returns the
     process exit code; the caller writes the run summary."""
     completed = 0
-    # `--claude-bin` maps to the claude binary only (proposal §3 flag table);
-    # other platforms fall back to their config/default binary until
-    # `--agent-bin` lands (B4). getattr default keeps backend=None (tests with
-    # run_agent mocked) on the historical claude path.
-    binary = args.claude_bin if getattr(backend, "name", "claude") == "claude" else None
+    # `--claude-bin` maps to the claude binary only; every other platform takes
+    # `--agent-bin` (proposal §3 flag table; None falls through to the
+    # platform's config/default binary). getattr default keeps backend=None
+    # (tests with run_agent mocked) on the historical claude path.
+    is_claude = getattr(backend, "name", "claude") == "claude"
+    binary = args.claude_bin if is_claude else args.agent_bin
+    # One frozen options bundle per run — every field is loop-invariant.
+    run_options = RunOptions(
+        binary=binary,
+        model=model,
+        permission_mode=args.permission_mode,
+        allowed_tools=allowed or [],
+        disallowed_tools=disallowed or [],
+        max_turns=args.max_turns,
+        sandbox=args.sandbox,
+        approve_mcps=args.approve_mcps,
+    )
     # Planned total, computed once: tasks left + tasks already done this run.
     sig = _Signaler(signals, out, q.root.name, total=completed + len(q.pending()))
     while True:
@@ -675,9 +744,12 @@ def _run_loop(
         _banner_start(completed, sig.total, task.stem, project, branch)
 
         if args.dry_run:
-            print(f"[dry-run] would invoke: claude -p (cwd={project}, "
-                  f"perm={args.permission_mode}, allowed={allowed}, "
-                  f"disallowed={disallowed})")
+            # Preview the real invocation, sourced from the backend (never a
+            # hard-coded `claude -p` — proposal C5), without spawning anything.
+            spec = backend.build_invoke(prompt, project, system_prompt, run_options)
+            print(f"[dry-run] platform: {backend.name}")
+            print(f"[dry-run] would invoke: {_preview_argv(spec.argv)} "
+                  f"(cwd={spec.cwd})")
             print(f"[dry-run] prompt ({len(prompt)} chars):")
             print(_indent(prompt[:2000]))
             return 0
@@ -689,14 +761,7 @@ def _run_loop(
             project,
             backend,
             system_prompt=system_prompt,
-            run_options=RunOptions(
-                binary=binary,
-                model=model,
-                permission_mode=args.permission_mode,
-                allowed_tools=allowed or [],
-                disallowed_tools=disallowed or [],
-                max_turns=args.max_turns,
-            ),
+            run_options=run_options,
         )
         outcome, questions, follow_ups = _route(q, running, result)
         acc.record_task(task_stem=running.stem, outcome=outcome, result=result)
@@ -1302,6 +1367,19 @@ def _is_container(q: Queue) -> bool:
     its own tasks — so commands can redirect instead of acting on an empty
     (or fabricated) queue."""
     return bool(q.subqueues()) and q.is_empty()
+
+
+def _preview_argv(argv: list[str], max_arg: int = 60) -> str:
+    """One-line display form of an argv for dry-run: multi-line args (the
+    injected contract riding on --append-system-prompt) collapse to one line
+    and long args truncate, so the preview stays readable. argv[0] (the
+    resolved binary path) is never truncated — it's what the user checks.
+    Display only — not guaranteed shell-pasteable."""
+    parts: list[str] = []
+    for i, a in enumerate(argv):
+        a = " ".join(a.split())
+        parts.append(a if i == 0 or len(a) <= max_arg else a[: max_arg - 1] + "…")
+    return " ".join(parts)
 
 
 def _indent(text: str, prefix: str = "  | ") -> str:
