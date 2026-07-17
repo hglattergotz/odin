@@ -200,6 +200,7 @@ class RunAccumulator:
                 "branch": self.branch,
                 "task": task_stem,
                 "outcome": outcome,
+                "platform": getattr(result, "platform", "claude"),
                 "stop_reason": getattr(result, "stop_reason", None),
                 "error": getattr(result, "error", None),
                 "wall_ms": getattr(result, "wall_ms", None),

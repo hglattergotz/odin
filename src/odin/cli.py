@@ -28,7 +28,7 @@ from .protocol import (
     FollowUp, Outcome, Question, parse, parse_follow_ups, parse_questions, unwrap_fence,
 )
 from .queue import Queue, Task, archive_finished_subqueues, archived_subqueues
-from .runner import RunResult, run_claude
+from .runner import RunResult, get_backend, run_agent
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -154,6 +154,15 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--claude-bin", default="claude",
         help="path to the claude CLI (default: claude on PATH)",
+    )
+    run.add_argument(
+        "--platform", choices=["claude", "grok"], default=None,
+        help="headless agent CLI to drive the queue (default: claude; also "
+             "$ODIN_PLATFORM). 'grok' uses grok-build's headless mode.",
+    )
+    run.add_argument(
+        "--grok-bin", default="grok",
+        help="path to the grok CLI (default: grok on PATH; used with --platform grok)",
     )
     run.add_argument(
         "--branch", default=None,
@@ -600,6 +609,16 @@ def _run_loop(
     completed = 0
     # Planned total, computed once: tasks left + tasks already done this run.
     sig = _Signaler(signals, out, q.root.name, total=completed + len(q.pending()))
+
+    # Which headless agent CLI drives the queue: --platform > $ODIN_PLATFORM > claude.
+    platform = args.platform or os.environ.get("ODIN_PLATFORM") or "claude"
+    try:
+        backend = get_backend(platform)
+    except ValueError as exc:
+        print(f"odin: {exc}")
+        return 2
+    agent_bin = args.grok_bin if platform == "grok" else args.claude_bin
+
     while True:
         if args.max_tasks and completed >= args.max_tasks:
             print(f"odin: reached --max-tasks={args.max_tasks}, stopping.")
@@ -618,7 +637,7 @@ def _run_loop(
         _banner_start(completed, sig.total, task.stem, project, branch)
 
         if args.dry_run:
-            print(f"[dry-run] would invoke: claude -p (cwd={project}, "
+            print(f"[dry-run] platform={platform} bin={agent_bin} (cwd={project}, "
                   f"perm={args.permission_mode}, allowed={allowed}, "
                   f"disallowed={disallowed})")
             print(f"[dry-run] prompt ({len(prompt)} chars):")
@@ -627,10 +646,11 @@ def _run_loop(
 
         sig.task_start(completed)
         running = q.claim_running(task)
-        result = run_claude(
+        result = run_agent(
             prompt,
             project,
-            claude_bin=args.claude_bin,
+            backend=backend,
+            bin=agent_bin,
             permission_mode=args.permission_mode,
             allowed_tools=allowed,
             disallowed_tools=disallowed,
