@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from odin.cli import main
 from odin.runner import ClaudeBackend, GrokBackend, get_backend, run_agent
 
 
@@ -176,3 +177,52 @@ def test_grok_streams_text_to_out(fake_grok: Path, project_dir: Path):
     finally:
         os.environ.pop("FAKE_GROK_SCENARIO", None)
     assert "Working" in sink.getvalue()
+
+
+# ----------------------------------------------------------------------
+# `odin exec` — single-shot headless dispatch (no queue)
+# ----------------------------------------------------------------------
+
+def test_exec_prompt_file_through_grok(fake_grok: Path, project_dir: Path, tmp_path: Path, capsys):
+    spec = tmp_path / "spec.md"
+    spec.write_text("do the thing")
+    os.environ["FAKE_GROK_SCENARIO"] = "completed"
+    try:
+        code = main([
+            "exec",
+            "--platform", "grok",
+            "--grok-bin", str(fake_grok),
+            "--prompt-file", str(spec),
+            "--project", str(project_dir),
+            "--no-metrics",
+        ])
+    finally:
+        os.environ.pop("FAKE_GROK_SCENARIO", None)
+    captured = capsys.readouterr()
+    assert code == 0
+    # Final text goes to stdout (capturable); the sentinel the agent emitted is there.
+    assert "<<<NEXT_CONTEXT>>>" in captured.out
+
+
+def test_exec_positional_prompt_and_failure_exit(fake_grok: Path, project_dir: Path, capsys):
+    os.environ["FAKE_GROK_SCENARIO"] = "error_event"
+    try:
+        code = main([
+            "exec", "do the thing",
+            "--platform", "grok",
+            "--grok-bin", str(fake_grok),
+            "--project", str(project_dir),
+            "--no-metrics",
+        ])
+    finally:
+        os.environ.pop("FAKE_GROK_SCENARIO", None)
+    assert code == 1  # backend failure → non-zero exit
+
+
+def test_exec_bad_prompt_file_is_error(project_dir: Path, tmp_path: Path):
+    code = main([
+        "exec", "--platform", "grok",
+        "--prompt-file", str(tmp_path / "does-not-exist.md"),
+        "--project", str(project_dir), "--no-metrics",
+    ])
+    assert code == 2

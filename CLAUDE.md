@@ -52,7 +52,8 @@ odin/
 ## CLI surface
 
 ```
-odin run    [QUEUE_DIR] [--project PATH] [--max-tasks N] [--allowed-tools LIST] [--disallowed-tools LIST] [--permission-mode MODE] [--branch NAME] [--base NAME] [--no-git] [--no-metrics] [--no-title] [--notify] [--tab-title PREFIX] [--tab-color HEX] [--no-color] [--completed-file] [--dry-run]
+odin run    [QUEUE_DIR] [--project PATH] [--max-tasks N] [--allowed-tools LIST] [--disallowed-tools LIST] [--permission-mode MODE] [--platform claude|grok] [--branch NAME] [--base NAME] [--no-git] [--no-metrics] [--no-title] [--notify] [--tab-title PREFIX] [--tab-color HEX] [--no-color] [--completed-file] [--dry-run]
+odin exec   [PROMPT] [--prompt-file PATH] [--project PATH] [--platform claude|grok] [--claude-bin PATH] [--grok-bin PATH] [--permission-mode MODE] [--allowed-tools LIST] [--disallowed-tools LIST] [--max-turns N] [--append-system-prompt TEXT] [--no-metrics] [--no-color]
 odin status [QUEUE_DIR]
 odin resume HELD_TASK [QUEUE_DIR]
 odin demo   DIR [--force]
