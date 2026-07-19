@@ -445,6 +445,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         project=project,
         queue=q.root,
         branch=branch,
+        platform=platform,
         enabled=metrics_on,
     )
     signals = _resolve_signals(args)
