@@ -28,10 +28,13 @@ def test_full_guide_covers_every_essential():
 
 def test_protocol_section_is_sourced_from_contract():
     # The injected contract text must appear verbatim in the guide (indented),
-    # so the guide can never drift from runtime behaviour.
+    # so the guide can never drift from runtime behaviour. Guide shows the
+    # default (Claude) wording; Cursor runs get AGENTS.md via platform=.
     contract = build_system_prompt(None)
     first_real_line = next(ln for ln in contract.splitlines() if ln.strip())
     assert first_real_line in render()
+    assert "CLAUDE.md" in contract
+    assert "AGENTS.md" not in contract
 
 
 def test_topic_subsets():

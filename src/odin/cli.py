@@ -434,7 +434,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if err is not None:
             return err
     # Always inject the protocol; add the branch directive when we have one.
-    system_prompt = build_system_prompt(branch)
+    # Pass platform so the injected text names the right instruction file
+    # (CLAUDE.md vs AGENTS.md) instead of hard-coding Claude's.
+    system_prompt = build_system_prompt(branch, platform=platform)
 
     # Central metrics: one accumulator per run, fed one record per task, with the
     # run summary written in a finally so it lands on every exit path. Off for
