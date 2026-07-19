@@ -51,12 +51,17 @@ def test_topic_subsets():
     assert "AGENTS.md" in am
     assert ".cursor/rules" in am
     assert "--platform cursor" in am
+    assert "--platform grok" in am
+    assert "Grok Build" in am
     assert "<<<NEXT_CONTEXT>>>" in am  # includes Cursor-worded protocol
     assert "AGENTS.md" in am
     assert "This project is run by Odin" in am
     # Cursor topic shows AGENTS.md in the injected contract, not CLAUDE.md
     assert "project's AGENTS.md" in am
     assert "## 1. The queue" not in am
+    # Universal binary flag (not Claude-only)
+    assert "--agent-bin" in am
+    assert "deprecated" in am.lower() or "alias" in am.lower()
 
     proto = render("protocol")
     assert "<<<NEXT_CONTEXT>>>" in proto
@@ -67,6 +72,18 @@ def test_full_guide_covers_agent_md():
     assert "AGENTS.md" in text
     assert "target-agents-md-snippet.md" in text
     assert "--platform cursor" in text
+    assert "--platform grok" in text
+    assert "Grok Build" in text
+    assert "Cursor CLI" in text
+    assert "Claude Code" in text
+
+
+def test_run_section_has_copy_paste_for_each_product():
+    run = render("tasks")  # includes run
+    assert "odin run <name> --platform cursor" in run
+    assert "odin run <name> --platform grok" in run
+    assert "--agent-bin" in run
+    assert "--yes" in run
 
 
 def test_cli_guide_agent_md(capsys):
