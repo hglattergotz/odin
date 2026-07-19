@@ -1,9 +1,11 @@
 """Interactive terminal prompts for Odin's human-in-the-loop paths.
 
-Two surfaces:
+Surfaces:
+  - ask_run_confirmation: at startup, confirm the resolved platform/model.
   - ask_branch_choice: at startup, pick the single branch the queue runs on.
   - render_questions / ask_questions: when a task emits NEEDS_INPUT, show the
     structured question(s) and collect answers in-terminal.
+  - ask_continue: after an urgent follow-up insert, continue or stop.
 
 Every function takes injectable in_/out streams (defaulting to sys.stdin /
 sys.stdout) so tests can drive them with StringIO instead of a real TTY.
@@ -14,6 +16,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TextIO
 
 from .protocol import Question
@@ -46,6 +49,64 @@ class BranchPlan:
     name: str          # branch to end up on
     base: str | None   # branch point when creating; None when reusing
     create: bool       # True -> create from base; False -> checkout/stay
+
+
+# ----------------------------------------------------------------------
+# pre-run platform/model confirmation
+# ----------------------------------------------------------------------
+
+def ask_run_confirmation(
+    *,
+    platform: str,
+    model: str | None,
+    binary: str | None = None,
+    queue_name: str,
+    pending_count: int,
+    project: Path,
+    in_: TextIO | None = None,
+    out: TextIO | None = None,
+) -> bool:
+    """Confirm the resolved platform/model before the first task. True=proceed.
+
+    On a non-TTY, prints a one-line summary and returns True (no wait) so CI
+    and pipes keep flowing. On a TTY, shows the summary and asks Y/n:
+    empty/y/yes → True; n/no/EOF → False (safe abort when nobody is there).
+    Callers skip this entirely for --dry-run and --yes.
+    """
+    in_ = in_ or sys.stdin
+    out = out or sys.stdout
+    model_display = model if model else "(platform default)"
+
+    try:
+        tty = bool(in_.isatty())
+    except Exception:
+        tty = False
+
+    if not tty:
+        out.write(f"odin: platform={platform} model={model_display}\n")
+        out.flush()
+        return True
+
+    out.write("\nOdin will run this queue with:\n\n")
+    out.write(f"  platform:  {platform}\n")
+    out.write(f"  model:     {model_display}\n")
+    if binary:
+        out.write(f"  binary:    {binary}\n")
+    out.write(f"  queue:     {queue_name}  ({pending_count} pending)\n")
+    out.write(f"  project:   {project}\n")
+    out.write("\n")
+    out.flush()
+
+    while True:
+        ans = _readline(in_, out, "  Proceed? [Y]es / [n]o: ")
+        if ans is None:
+            return False
+        a = ans.strip().lower()
+        if a in ("", "y", "yes"):
+            return True
+        if a in ("n", "no"):
+            return False
+        out.write("  Please type y or n.\n")
 
 
 # ----------------------------------------------------------------------

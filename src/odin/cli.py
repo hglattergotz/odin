@@ -25,7 +25,7 @@ from .guide import TOPICS, render as render_guide
 from .lint import scan_project_instructions
 from .prompts import (
     BranchPlan, ask_branch_choice, ask_config, ask_continue, ask_questions,
-    render_questions,
+    ask_run_confirmation, render_questions,
 )
 from .protocol import (
     FollowUp, Outcome, Question, parse, parse_follow_ups, parse_questions, unwrap_fence,
@@ -256,6 +256,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true",
         help="show what would run without invoking claude",
     )
+    run.add_argument(
+        "-y", "--yes", action="store_true",
+        help="skip the interactive platform/model confirmation on a TTY "
+             "(scripts that want defaults without hanging). Non-TTY runs "
+             "already skip the prompt.",
+    )
     run.set_defaults(func=_cmd_run)
 
     st = sub.add_parser("status", help="show queue state")
@@ -422,6 +428,26 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # Missing-instruction warning must run *after* backend resolution so an
     # AGENTS.md-only Cursor project is not falsely flagged for CLAUDE.md.
     _warn_missing_instructions(project, backend)
+
+    # Pre-run platform/model confirmation. Skipped on --dry-run (argv preview
+    # is enough) and --yes (scripts). Non-TTY gets a one-line info print and
+    # continues; abort here exits 0 with no tasks / metrics / COMPLETED.md.
+    if not args.dry_run and not args.yes:
+        is_claude = platform == "claude"
+        binary = (
+            (args.claude_bin if is_claude else args.agent_bin)
+            or backend.default_binary()
+        )
+        if not ask_run_confirmation(
+            platform=platform,
+            model=model,
+            binary=binary,
+            queue_name=q.root.name,
+            pending_count=len(q.pending()),
+            project=project,
+        ):
+            print("odin: aborted.")
+            return 0
 
     # Startup git setup: clean-tree check + select/create the one branch the
     # whole queue lands on. Skipped on --dry-run and for non-git projects.

@@ -408,6 +408,94 @@ def test_dry_run_prints_prompt_and_does_not_invoke(setup, capsys):
 
 
 # ----------------------------------------------------------------------
+# pre-run platform/model confirmation
+# ----------------------------------------------------------------------
+
+class _TTYConfirm(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def test_run_confirm_tty_yes_proceeds(setup, monkeypatch, capsys):
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    monkeypatch.setattr("sys.stdin", _TTYConfirm("\n"))  # empty = proceed
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake), "--no-git"],
+        scenario="completed",
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Odin will run this queue with:" in out
+    assert "platform:  claude" in out
+    assert "model:     (platform default)" in out
+    assert (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_confirm_tty_no_aborts_untouched(setup, monkeypatch, capsys):
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    monkeypatch.setattr("sys.stdin", _TTYConfirm("n\n"))
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake), "--no-git"],
+        scenario="completed",
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "odin: aborted." in out
+    assert (qdir / "pending" / "001-a.md").exists()
+    assert not (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_confirm_non_tty_info_line_proceeds(setup, capsys):
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    # pytest stdin is not a TTY → info line, no prompt wait.
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake), "--no-git"],
+        scenario="completed",
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "odin: platform=claude model=(platform default)" in out
+    assert "Proceed?" not in out
+    assert (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_confirm_yes_flag_skips_prompt_on_tty(setup, monkeypatch, capsys):
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    monkeypatch.setattr("sys.stdin", _TTYConfirm("n\n"))  # would abort if prompted
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake),
+         "--no-git", "--yes"],
+        scenario="completed",
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Proceed?" not in out
+    assert "odin: aborted." not in out
+    assert (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_confirm_dry_run_skips_prompt(setup, monkeypatch, capsys):
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md", "the task body")
+    monkeypatch.setattr("sys.stdin", _TTYConfirm("n\n"))  # would abort if prompted
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake),
+         "--dry-run"],
+        scenario="completed",
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[dry-run]" in out
+    assert "Proceed?" not in out
+    assert "odin: aborted." not in out
+    assert (qdir / "pending" / "001-a.md").exists()
+
+
+# ----------------------------------------------------------------------
 # platform / model selection (Batch A4)
 # ----------------------------------------------------------------------
 
@@ -814,10 +902,12 @@ def test_interactive_held_answers_and_continues(setup, monkeypatch, tmp_path):
     state = tmp_path / "state"
     monkeypatch.setenv("ODIN_STATE_FILE", str(state))
     # Pretend we're on a TTY and answer the single question with option "a".
+    # --yes skips the pre-run confirm so stdin is only for the held Q&A.
     monkeypatch.setattr("sys.stdin", _TTYStdin("a\n"))
 
     rc = _run_cli(
-        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake), "--no-git"],
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake),
+         "--no-git", "--yes"],
         scenario="held_json_then_done",
     )
     assert rc == 0
@@ -893,9 +983,11 @@ def test_followup_urgent_tty_continue_runs_it_next(setup, monkeypatch, tmp_path)
     project, qdir, fake = setup
     _seed_task(qdir, "001-a.md")
     monkeypatch.setenv("ODIN_STATE_FILE", str(tmp_path / "state"))
+    # --yes skips the pre-run confirm so stdin is only for ask_continue.
     monkeypatch.setattr("sys.stdin", _TTYStdinFollow("c\n"))  # answer "continue"
     rc = _run_cli(
-        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake), "--no-git"],
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake),
+         "--no-git", "--yes"],
         scenario="followup_urgent_once",
     )
     assert rc == 0
