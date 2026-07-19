@@ -17,18 +17,14 @@ import pytest
 
 from odin.backends import AgentBackend, ClaudeBackend, CursorBackend, GrokBackend, get_backend
 from odin.backends.base import AgentInvokeSpec, RunOptions
-from odin.backends.registry import DEFAULT_PLATFORM, available_platforms
-
-
-def test_default_resolves_to_claude():
-    backend = get_backend()
-    assert isinstance(backend, ClaudeBackend)
-    assert isinstance(backend, AgentBackend)
-    assert backend.name == "claude"
+from odin.backends.registry import available_platforms
 
 
 def test_explicit_claude_resolves():
-    assert isinstance(get_backend("claude"), ClaudeBackend)
+    backend = get_backend("claude")
+    assert isinstance(backend, ClaudeBackend)
+    assert isinstance(backend, AgentBackend)
+    assert backend.name == "claude"
 
 
 def test_platform_name_is_case_insensitive():
@@ -47,16 +43,21 @@ def test_unknown_platform_message_lists_available():
     assert "claude" in str(excinfo.value)
 
 
+def test_empty_platform_raises():
+    with pytest.raises(ValueError, match="platform name is required"):
+        get_backend("")
+
+
 def test_each_call_yields_a_fresh_instance():
-    assert get_backend() is not get_backend()
+    assert get_backend("claude") is not get_backend("claude")
 
 
-def test_default_platform_is_available():
-    assert DEFAULT_PLATFORM in available_platforms()
+def test_available_platforms_lists_peers():
+    assert available_platforms() == ["claude", "cursor", "grok"]
 
 
 def test_claude_metadata():
-    backend = get_backend()
+    backend = get_backend("claude")
     assert backend.default_binary() == "claude"
     assert backend.instruction_files() == [Path("CLAUDE.md")]
 

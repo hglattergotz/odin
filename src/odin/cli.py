@@ -193,10 +193,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--platform", default=None,
-        help="agent platform: claude (Claude Code), cursor (Cursor CLI), "
-             "grok (Grok Build), … (resolution: this flag → $ODIN_PLATFORM → "
-             "default_platform in config → claude). See docs/agent-backends.md. "
-             "Unknown names error clearly via the registry.",
+        help="required unless $ODIN_PLATFORM or default_platform in config is "
+             "set: claude (Claude Code), cursor (Cursor CLI), grok (Grok Build). "
+             "No built-in product default. See docs/agent-backends.md.",
     )
     run.add_argument(
         "--model", default=None,
@@ -254,7 +253,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--dry-run", action="store_true",
-        help="show what would run without invoking claude",
+        help="show what would run without invoking the agent",
     )
     run.add_argument(
         "-y", "--yes", action="store_true",
@@ -412,12 +411,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if args.disallowed_tools else None
     )
 
-    # Resolve the agent platform + model (CLI flag → env → config → fallback)
-    # and pick the backend. Resolved before the dry-run branch so an unknown
-    # `--platform` fails loudly even on a dry run. An unknown name (a typo, or
-    # a platform not yet wired) is a hard error from the registry, not a
-    # silent fallback to claude.
-    platform = config.resolve_platform(args.platform)
+    # Resolve the agent platform + model (CLI flag → env → config; no product
+    # default) and pick the backend. Resolved before the dry-run branch so a
+    # missing/unknown `--platform` fails loudly even on a dry run.
+    try:
+        platform = config.resolve_platform(args.platform)
+    except config.PlatformRequiredError as e:
+        print(f"odin: {e}", file=sys.stderr)
+        return 2
     model = config.resolve_model(args.model, platform=platform)
     try:
         backend = get_backend(platform)
@@ -1383,10 +1384,14 @@ def _config_show(path: Path) -> int:
     body = config.dump_toml(cfg)
     print(body if body.strip() else "# (empty)")
     # Effective resolution (factors in env vars), for orientation.
-    platform = config.resolve_platform(config=cfg)
-    model = config.resolve_model(platform=platform, config=cfg)
-    print(f"# effective platform: {platform}")
-    print(f"# effective model:    {model if model else '(platform default)'}")
+    platform = config.try_resolve_platform(config=cfg)
+    if platform is None:
+        print("# effective platform: (unset — pass --platform or set default_platform)")
+        print("# effective model:    (n/a until platform is set)")
+    else:
+        model = config.resolve_model(platform=platform, config=cfg)
+        print(f"# effective platform: {platform}")
+        print(f"# effective model:    {model if model else '(platform default)'}")
     return 0
 
 

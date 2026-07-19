@@ -3,11 +3,10 @@
 `get_backend(name)` is the single resolution point the CLI and runner use to
 turn a `--platform` value into an `AgentBackend`. New platforms register by
 adding an entry to `_BACKENDS`. Resolution is case-insensitive; an unknown name
-is a hard error (no silent fallback — a typo'd `--platform` should fail loudly,
-not quietly run Claude).
+is a hard error (no silent fallback). Every registered backend is a peer.
 
-Every registered backend is a peer: Claude is the *default*, not a privileged
-code path in the loop.
+Platform selection itself lives in `config.resolve_platform` (flag → env →
+config). The registry never invents a default product.
 """
 
 from __future__ import annotations
@@ -16,9 +15,6 @@ from odin.backends.base import AgentBackend
 from odin.backends.claude import ClaudeBackend
 from odin.backends.cursor import CursorBackend
 from odin.backends.grok import GrokBackend
-
-#: The default platform when none is specified — preserves today's behaviour.
-DEFAULT_PLATFORM = "claude"
 
 # name -> zero-arg factory. Factories (not instances) so each call yields a
 # fresh backend and registration stays cheap to import.
@@ -34,12 +30,17 @@ def available_platforms() -> list[str]:
     return sorted(_BACKENDS)
 
 
-def get_backend(name: str | None = None) -> AgentBackend:
-    """Return a fresh backend for `name` (defaults to `"claude"`).
+def get_backend(name: str) -> AgentBackend:
+    """Return a fresh backend for `name`.
 
-    Raises `ValueError` for an unknown platform.
+    Raises `ValueError` for an unknown or empty platform.
     """
-    key = (name or DEFAULT_PLATFORM).strip().lower()
+    if not name or not str(name).strip():
+        raise ValueError(
+            "platform name is required; available platforms: "
+            + ", ".join(available_platforms())
+        )
+    key = str(name).strip().lower()
     try:
         factory = _BACKENDS[key]
     except KeyError:

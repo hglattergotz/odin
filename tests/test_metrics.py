@@ -368,7 +368,7 @@ def test_run_records_metrics_end_to_end(tmp_path, monkeypatch):
     fake.chmod(0o755)
 
     rc = main(["run", str(qdir), "--project", str(project), "--no-git",
-               "--claude-bin", str(fake)])
+               "--platform", "claude", "--claude-bin", str(fake)])
     assert rc == 0
 
     events = metrics.read_events(events_file)
@@ -412,6 +412,6 @@ def test_run_no_metrics_flag_writes_nothing(tmp_path, monkeypatch):
     fake.chmod(0o755)
 
     rc = main(["run", str(qdir), "--project", str(project), "--no-git",
-               "--no-metrics", "--claude-bin", str(fake)])
+               "--platform", "claude", "--no-metrics", "--claude-bin", str(fake)])
     assert rc == 0
     assert not events_file.exists()

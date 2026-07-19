@@ -61,7 +61,7 @@ def _run_cmd(tmp_path, monkeypatch, *, tasks, results, extra_args=()):
     seq = list(results)
     monkeypatch.setattr("odin.cli.run_agent", lambda *a, **k: seq.pop(0))
     argv = ["run", str(qdir), "--project", str(project), "--no-git",
-            "--no-metrics", *extra_args]
+            "--platform", "claude", "--no-metrics", *extra_args]
     args = _build_parser().parse_args(argv)
     rc = _cmd_run(args)
     return rc, q

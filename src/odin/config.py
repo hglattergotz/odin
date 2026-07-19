@@ -3,8 +3,8 @@
 Odin reads an optional user config file on every `odin run` to supply defaults
 for the agent platform and model. The file lives at `$ODIN_HOME/config.toml`
 (default `~/.odin/config.toml`); `$ODIN_CONFIG` overrides the full path. A
-missing file is not an error — it yields empty defaults (platform falls back to
-`"claude"`, model unset).
+missing file is not an error. There is **no built-in default platform**: you
+must set `--platform`, `$ODIN_PLATFORM`, or `default_platform` in config.
 
 Reading uses stdlib `tomllib` (Python 3.11+). Writing (`odin config set …`)
 uses a **hand-rolled minimal TOML writer** below — `tomllib` is read-only and
@@ -12,10 +12,10 @@ uses a **hand-rolled minimal TOML writer** below — `tomllib` is read-only and
 writer covers the flat/small schema Odin emits (top-level scalars + nested
 `[platforms.<p>]` tables of scalars); it is not a general TOML serialiser.
 
-Resolution order (proposal §3):
+Resolution order:
 
 - platform: `--platform` flag → `$ODIN_PLATFORM` → `default_platform` in config
-  → `"claude"`.
+  → error if unset (no silent product default).
 - model: `--model` flag → `$ODIN_MODEL` → `platforms.<platform>.model` in config
   → `None` (unset; no `--model` emitted to the CLI).
 """
@@ -28,8 +28,6 @@ import tempfile
 import tomllib
 from pathlib import Path
 
-from odin.backends.registry import DEFAULT_PLATFORM
-
 #: Curated model suggestions per platform for the interactive picker. These
 #: drift over time, so the picker always also offers free-text entry and an
 #: "unset" choice — this list is convenience, never a validation allowlist.
@@ -38,6 +36,10 @@ MODEL_SUGGESTIONS: dict[str, list[str]] = {
     "cursor": ["composer-2.5-fast", "composer-2.5", "cursor-grok-4.5-high"],
     "grok": [],  # free-text / unset — Grok Build model ids drift with the CLI
 }
+
+
+class PlatformRequiredError(ValueError):
+    """Raised when no platform was set via flag, env, or config."""
 
 
 def odin_home() -> Path:
@@ -60,7 +62,7 @@ def load_config(path: Path | None = None) -> dict:
     """Parse the config TOML; missing or unreadable file → empty dict.
 
     Best-effort: a malformed file is swallowed and treated as empty so a typo
-    in config can never sink a run (resolution then falls back to defaults).
+    in config can never sink a run.
     """
     target = path if path is not None else config_path()
     try:
@@ -87,7 +89,11 @@ def resolve_platform(
     *,
     config: dict | None = None,
 ) -> str:
-    """Resolve the active platform per the order above (always lowercased)."""
+    """Resolve the active platform (always lowercased).
+
+    Raises `PlatformRequiredError` when flag, env, and config are all unset —
+    Odin never assumes Claude Code (or any other product) by default.
+    """
     if cli_flag and cli_flag.strip():
         return cli_flag.strip().lower()
     env = os.environ.get("ODIN_PLATFORM")
@@ -98,16 +104,31 @@ def resolve_platform(
     default = config.get("default_platform")
     if isinstance(default, str) and default.strip():
         return default.strip().lower()
-    return DEFAULT_PLATFORM
+    raise PlatformRequiredError(
+        "platform is required: pass --platform {claude,cursor,grok}, "
+        "set $ODIN_PLATFORM, or `odin config set default_platform …`"
+    )
+
+
+def try_resolve_platform(
+    cli_flag: str | None = None,
+    *,
+    config: dict | None = None,
+) -> str | None:
+    """Like `resolve_platform`, but returns None instead of raising."""
+    try:
+        return resolve_platform(cli_flag, config=config)
+    except PlatformRequiredError:
+        return None
 
 
 def resolve_model(
     cli_flag: str | None = None,
     *,
-    platform: str = DEFAULT_PLATFORM,
+    platform: str,
     config: dict | None = None,
 ) -> str | None:
-    """Resolve the model per the order above; `None` means "unset" (CLI default).
+    """Resolve the model for `platform`; `None` means "unset" (CLI default).
 
     Model IDs are case-sensitive, so the value is only stripped, never
     lowercased. `platform` selects which `[platforms.<platform>.model]` to read.

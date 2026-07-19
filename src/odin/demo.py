@@ -5,8 +5,9 @@ whose queue exercises Odin end-to-end: sequential carry-context, a held →
 resume cycle (task 005 is deliberately underspecified), and a final task. Run
 it, watch it build `greeter`, then re-scaffold with `--force` to start over.
 
-The fixture is **Claude-only for v1** (`CLAUDE.md` + default platform). Cursor
-smoke-testing is documented as a manual step in the demo readme
+The fixture is **Claude Code-only for v1** (`CLAUDE.md`). Drive it with
+`--platform claude` (platform is never assumed). Cursor smoke-testing is
+documented as a manual step in the demo readme
 (`odin run --platform cursor`), not baked into the scaffold.
 
 The fixture content lives in `_demo_files.py` (generated). This module is the

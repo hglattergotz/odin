@@ -78,8 +78,15 @@ def test_load_uses_config_path_when_unset(monkeypatch, tmp_path):
 # --- resolve_platform ------------------------------------------------------
 
 
-def test_platform_fallback_is_claude():
-    assert config.resolve_platform(config={}) == "claude"
+def test_platform_required_when_unset():
+    import pytest
+
+    with pytest.raises(config.PlatformRequiredError, match="platform is required"):
+        config.resolve_platform(config={})
+
+
+def test_try_resolve_platform_none_when_unset():
+    assert config.try_resolve_platform(config={}) is None
 
 
 def test_platform_flag_wins(monkeypatch):
@@ -113,7 +120,7 @@ def test_platform_loads_config_when_not_passed(monkeypatch, tmp_path):
 
 
 def test_model_unset_by_default():
-    assert config.resolve_model(config={}) is None
+    assert config.resolve_model(platform="claude", config={}) is None
 
 
 def test_model_flag_wins(monkeypatch):

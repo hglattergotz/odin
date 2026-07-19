@@ -80,10 +80,12 @@ def test_full_guide_covers_agent_md():
 
 def test_run_section_has_copy_paste_for_each_product():
     run = render("tasks")  # includes run
+    assert "odin run <name> --platform claude" in run
     assert "odin run <name> --platform cursor" in run
     assert "odin run <name> --platform grok" in run
     assert "--agent-bin" in run
     assert "--yes" in run
+    assert "Claude Code (default)" not in run
 
 
 def test_cli_guide_agent_md(capsys):

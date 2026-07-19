@@ -126,9 +126,8 @@ class CursorBackend(AgentBackend):
         system_prompt: str | None,
         run_options: RunOptions,
     ) -> AgentInvokeSpec:
-        # Lazy import: odin.config imports the backend registry (for
-        # DEFAULT_PLATFORM) and the registry imports this module, so a
-        # module-level import here would complete an import cycle.
+        # Lazy import keeps backends free of a hard config dependency at
+        # module load (config may still grow registry awareness later).
         from odin import config
 
         cfg = config.load_config()

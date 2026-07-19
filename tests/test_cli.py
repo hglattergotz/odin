@@ -87,6 +87,10 @@ def _seed_task(queue_dir: Path, name: str, body: str = "task body") -> None:
 
 
 def _run_cli(args: list[str], scenario: str | None = None) -> int:
+    # Claude-path tests historically omitted --platform; inject it so they stay
+    # explicit now that a missing platform is an error (no product default).
+    if args and args[0] == "run" and "--platform" not in args:
+        args = [*args, "--platform", "claude"]
     if scenario is not None:
         os.environ["FAKE_CLAUDE_SCENARIO"] = scenario
     try:
@@ -499,8 +503,8 @@ def test_run_confirm_dry_run_skips_prompt(setup, monkeypatch, capsys):
 # platform / model selection (Batch A4)
 # ----------------------------------------------------------------------
 
-def test_run_platform_claude_behaves_identically(setup, monkeypatch):
-    """`--platform claude` is the default path — same outcome as no flag."""
+def test_run_platform_claude_explicit(setup, monkeypatch):
+    """`--platform claude` selects Claude Code and completes a task."""
     monkeypatch.delenv("ODIN_PLATFORM", raising=False)
     monkeypatch.delenv("ODIN_MODEL", raising=False)
     project, qdir, fake = setup
@@ -512,6 +516,22 @@ def test_run_platform_claude_behaves_identically(setup, monkeypatch):
     )
     assert rc == 0
     assert (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_platform_required_when_unset(setup, monkeypatch, capsys):
+    """No --platform / env / config → hard error (no silent Claude default)."""
+    monkeypatch.delenv("ODIN_PLATFORM", raising=False)
+    monkeypatch.delenv("ODIN_MODEL", raising=False)
+    monkeypatch.delenv("ODIN_CONFIG", raising=False)
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    # Call main directly so the test helper does not inject --platform.
+    rc = main(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake),
+         "--no-git", "--dry-run"],
+    )
+    assert rc == 2
+    assert "platform is required" in capsys.readouterr().err
 
 
 def _arg_recorder(path: Path, log: Path) -> Path:
@@ -724,7 +744,7 @@ def test_run_cursor_sandbox_and_approve_mcps_flags_forwarded(setup, tmp_path, mo
 
 
 def test_run_claude_warns_and_ignores_cursor_flags(setup, tmp_path, monkeypatch, capsys):
-    """Cursor-only flags on the (default) claude platform warn once and are
+    """Cursor-only flags on the claude platform warn once and are
     dropped — the run proceeds and the claude argv never sees them."""
     _clean_platform_env(monkeypatch)
     project, qdir, _ = setup
@@ -1219,6 +1239,15 @@ def test_config_show_includes_effective(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "effective platform: claude" in out
     assert "effective model:    (platform default)" in out
+
+
+def test_config_show_unset_platform(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "config.toml"
+    monkeypatch.setenv("ODIN_CONFIG", str(cfg))
+    monkeypatch.delenv("ODIN_PLATFORM", raising=False)
+    assert main(["config", "show"]) == 0
+    out = capsys.readouterr().out
+    assert "effective platform: (unset" in out
 
 
 def test_config_set_coerces_bool(tmp_path, monkeypatch):

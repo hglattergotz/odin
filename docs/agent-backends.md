@@ -1,15 +1,16 @@
 # Agent backends: supported products
 
 Odin drives a queue of tasks through a **headless coding-agent CLI**, one fresh
-session per task. Which product it uses is selected with `--platform`. Every
-backend is a peer implementing the same `AgentBackend` interface in
-`src/odin/backends/` — Claude Code is the default, not a privileged code path.
+session per task. Which product it uses is selected with `--platform` (or
+`$ODIN_PLATFORM` / `default_platform` in config). Every backend is a peer
+implementing the same `AgentBackend` interface in `src/odin/backends/`. There
+is no built-in default product.
 
 ## Public names (use these)
 
 | Public product | `--platform` | Binary on `PATH` | Odin class |
 |----------------|--------------|------------------|------------|
-| **[Claude Code](https://code.claude.com/docs)** (Anthropic) | `claude` (default) | `claude` | `ClaudeBackend` |
+| **[Claude Code](https://code.claude.com/docs)** (Anthropic) | `claude` | `claude` | `ClaudeBackend` |
 | **[Cursor CLI](https://cursor.com/docs/cli/overview)** (Cursor) | `cursor` | `agent` | `CursorBackend` |
 | **[Grok Build](https://docs.x.ai/build/overview)** (xAI) | `grok` | `grok` | `GrokBackend` |
 
@@ -27,14 +28,15 @@ For design rationale and roadmap, see
 ## Selecting a backend
 
 ```
-odin run <queue>                          # Claude Code (default)
+odin run <queue> --platform claude        # Claude Code
 odin run <queue> --platform cursor        # Cursor CLI
 odin run <queue> --platform grok          # Grok Build
 ODIN_PLATFORM=cursor odin run <queue>     # via environment
+odin config set default_platform cursor   # persist so --platform can be omitted
 ```
 
 Resolution: **`--platform` → `$ODIN_PLATFORM` → `default_platform` in
-`~/.odin/config.toml` → `claude`**. Unknown names fail via the registry
+`~/.odin/config.toml` → error if unset**. Unknown names fail via the registry
 (`available platforms: claude, cursor, grok`).
 
 Binary override (any platform): **`--agent-bin`** → config
@@ -42,6 +44,10 @@ Binary override (any platform): **`--agent-bin`** → config
 alias that only applies when the resolved platform is `claude`.
 
 Model: **`--model` → `$ODIN_MODEL` → `platforms.<p>.model` → unset** (CLI default).
+Model and platform are independent strings: a mismatched pair (for example
+`--platform claude --model cursor-grok-4.5-high`) will fail at the agent CLI.
+Requiring an explicit platform keeps that failure from happening by surprise
+when you only set a model.
 
 ## What the generic loop owns vs what a backend owns
 

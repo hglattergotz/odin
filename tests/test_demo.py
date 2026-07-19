@@ -30,9 +30,10 @@ def test_create_demo_writes_fixture_and_empty_queue(tmp_path: Path):
     assert (dest / "CLAUDE.md").exists()
     assert (dest / "task.md").exists()
     assert (dest / "readme.md").exists()
-    # Demo stays Claude-only for v1; Cursor is a manual smoke-test note only.
+    # Demo stays Claude Code-only for v1; Cursor is a manual smoke-test note.
     readme = (dest / "readme.md").read_text()
-    assert "Claude-only for v1" in readme
+    assert "Claude Code fixture" in readme
+    assert "--platform claude" in readme
     assert "--platform cursor" in readme
     assert not (dest / "AGENTS.md").exists()
 

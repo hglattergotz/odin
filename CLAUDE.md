@@ -3,9 +3,10 @@
 ## Purpose
 
 Odin is a minimal CLI that runs a queue of tasks through a headless agent
-CLI — **Claude Code** (`claude`) by default, **Cursor CLI** (`agent`) with
-`--platform cursor`, or **Grok Build** (`grok`) with `--platform grok` — one
-task at a time. It parses the structured output, carries context forward
+CLI: **Claude Code** (`claude`), **Cursor CLI** (`agent`), or **Grok Build**
+(`grok`). You select the product with `--platform` (or `$ODIN_PLATFORM` /
+`default_platform` in config). There is no built-in default. Tasks run one
+at a time. Odin parses the structured output, carries context forward
 between tasks, and halts cleanly when the agent needs human input.
 
 Orchestration is intentionally dumb. Odin does not dictate workflow
@@ -24,7 +25,7 @@ product names** in docs; the short `--platform` key matches the binary:
 
 | Public product | `--platform` | Binary | Class |
 |----------------|--------------|--------|-------|
-| Claude Code | `claude` (default) | `claude` | `ClaudeBackend` |
+| Claude Code | `claude` | `claude` | `ClaudeBackend` |
 | Cursor CLI | `cursor` | `agent` | `CursorBackend` |
 | Grok Build | `grok` | `grok` | `GrokBackend` |
 
@@ -32,7 +33,7 @@ See `docs/agent-backends.md` for invoke details. Design notes:
 `docs/multi-platform-agents-proposal.md`.
 
 `--platform` / `$ODIN_PLATFORM` / `default_platform` in config selects the
-backend; unknown names are a hard error.
+backend; if all are unset, `odin run` errors. Unknown names are a hard error.
 ## Language and layout
 
 Python 3.11+, **uv-managed**. Zero runtime dependencies (stdlib only).
@@ -140,10 +141,11 @@ Defaults:
   via `cli._resolve_queue_arg`.
 - `--project` = current working directory
 - `--platform` = unset → `$ODIN_PLATFORM` → `default_platform` in config →
-  `claude`. Registered peers: `claude`, `cursor`, `grok` (see
-  `docs/agent-backends.md`). Unknown names are a hard registry error.
-  `--model` = unset → `$ODIN_MODEL` → `platforms.<platform>.model`
-  → platform CLI default (no `--model` flag emitted).
+  error if still unset (no built-in product default). Registered peers:
+  `claude`, `cursor`, `grok` (see `docs/agent-backends.md`). Unknown names
+  are a hard registry error. `--model` = unset → `$ODIN_MODEL` →
+  `platforms.<platform>.model` → platform CLI default (no `--model` flag
+  emitted).
 - `--agent-bin` = unset → config `platforms.<p>.binary` → backend default
   (works for every platform). `--claude-bin` is a deprecated alias that only
   applies when platform is `claude`. Cursor autonomy flags
@@ -374,7 +376,7 @@ uv tool install --from /path/to/odin odin
 
 # from inside any project
 cd ~/code/myproject
-odin run                       # uses ./queue, --project=$PWD, platform=claude
+odin run --platform claude     # Claude Code (`claude`)
 odin run --platform cursor     # Cursor CLI (`agent`)
 odin run --platform grok       # Grok Build (`grok`)
 ```

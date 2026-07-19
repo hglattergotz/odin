@@ -18,15 +18,17 @@ from .contract import build_system_prompt
 _INTRO = """\
 # Authoring tasks for Odin
 
-Odin runs a queue of tasks through a headless agent CLI — **Claude Code**
-(`claude`) by default, **Cursor CLI** (`agent`) with `--platform cursor`, or
-**Grok Build** (`grok`) with `--platform grok` — one at a time, each in a
-fresh session, carrying context forward and pausing for input. Your job as
-the author is to produce two things: a **queue of task files** and
-(optionally) a **project instruction file** with your workflow rules
-(`CLAUDE.md` for Claude Code, `AGENTS.md` / `.cursor/rules` for Cursor CLI).
-See `odin guide agent-md` and `docs/agent-backends.md` for the product ↔
-platform map. This guide is everything you need to do that.
+Odin runs a queue of tasks through a headless agent CLI. You pick the
+product explicitly: **Claude Code** (`claude`), **Cursor CLI** (`agent`), or
+**Grok Build** (`grok`) via `--platform`, `$ODIN_PLATFORM`, or
+`default_platform` in config. There is no built-in default product. Tasks
+run one at a time, each in a fresh session, with context carried forward
+and pauses for input. Your job as the author is to produce two things: a
+**queue of task files** and (optionally) a **project instruction file** with
+your workflow rules (`CLAUDE.md` for Claude Code / Grok Build, `AGENTS.md` /
+`.cursor/rules` for Cursor CLI). See `odin guide agent-md` and
+`docs/agent-backends.md` for the product ↔ platform map. This guide is
+everything you need to do that.
 """
 
 _QUEUE = """\
@@ -142,15 +144,17 @@ commands (including Grok Build), see §3b / `odin guide agent-md`.
 _AGENT_MD = """\
 ## 3b. Supported products, instruction files, and how to run
 
-Odin talks to one of these headless products (peers — Claude Code is only the
-default, not a special case). Prefer **public product names** in prose; the
-short `--platform` key matches the binary:
+Odin talks to one of these headless products (peers; none is preferred). Prefer
+**public product names** in prose; the short `--platform` key matches the binary:
 
 | Public product | `--platform` | Binary on `PATH` | Instruction files |
 |----------------|--------------|------------------|-------------------|
-| **Claude Code** | `claude` (default) | `claude` | `CLAUDE.md` |
+| **Claude Code** | `claude` | `claude` | `CLAUDE.md` |
 | **Cursor CLI** | `cursor` | `agent` | `AGENTS.md`, `.cursor/rules` |
 | **Grok Build** | `grok` | `grok` | `CLAUDE.md` (same warn path today) |
+
+`--platform` is required unless `$ODIN_PLATFORM` or `default_platform` in
+config is set. There is no built-in product default.
 
 Missing-instruction warn: Claude Code / Grok Build → no `CLAUDE.md`; Cursor CLI
 → neither `AGENTS.md` nor `.cursor/rules`. Claude/Grok ignore AGENTS.md for
@@ -212,8 +216,8 @@ Pasteable snippets: `examples/target-agents-md-snippet.md` (Cursor CLI) and
     mkdir -p queue/<name>/pending
     # write NNN-slug.md task files into that pending/ dir
 
-    # Claude Code (default) — binary `claude`
-    odin run <name> --branch <name>
+    # Claude Code — binary `claude`
+    odin run <name> --platform claude --branch <name>
 
     # Cursor CLI — binary `agent`
     odin run <name> --platform cursor --branch <name>
@@ -228,7 +232,8 @@ Useful flags (any platform):
   (`--claude-bin` is a deprecated Claude-only alias)
 - `--yes` / `-y` — skip the TTY platform/model confirmation
 - `--dry-run` — print resolved platform + argv without starting
-- `odin config set default_platform cursor` — persist a default
+- `odin config set default_platform cursor` — persist a default so you can
+  omit `--platform` on later runs
 
 Cursor CLI-only: `--sandbox`, `--approve-mcps`, `--force`, `--trust` (warn+ignore
 on other platforms). See `odin run -h`.
@@ -395,8 +400,8 @@ _RUN = """\
     mkdir -p queue/<name>/pending      # one named sub-queue per batch of work
     # write your NNN-slug.md task files into queue/<name>/pending/
 
-    # Claude Code (default) — needs `claude` on PATH
-    odin run <name> --branch <name>
+    # Claude Code — needs `claude` on PATH
+    odin run <name> --platform claude --branch <name>
 
     # Cursor CLI — needs `agent` on PATH
     odin run <name> --platform cursor --branch <name>
