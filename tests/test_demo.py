@@ -30,6 +30,11 @@ def test_create_demo_writes_fixture_and_empty_queue(tmp_path: Path):
     assert (dest / "CLAUDE.md").exists()
     assert (dest / "task.md").exists()
     assert (dest / "readme.md").exists()
+    # Demo stays Claude-only for v1; Cursor is a manual smoke-test note only.
+    readme = (dest / "readme.md").read_text()
+    assert "Claude-only for v1" in readme
+    assert "--platform cursor" in readme
+    assert not (dest / "AGENTS.md").exists()
 
     # All seven tasks land in pending, in order.
     pending = sorted(p.name for p in (dest / "queue" / "pending").glob("*.md"))

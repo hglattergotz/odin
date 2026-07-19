@@ -2,9 +2,10 @@
 
 The point of this command is self-discovery: an agent working in *another*
 project (one being built with Odin) can run `odin guide` and learn everything
-it needs to author a valid Odin queue and a compatible CLAUDE.md — no other
-context, no human explanation. The global `odin` is on PATH even when the Odin
-source tree isn't reachable, so the CLI is the reliable discovery path.
+it needs to author a valid Odin queue and compatible project instructions
+(`CLAUDE.md` / `AGENTS.md`) — no other context, no human explanation. The
+global `odin` is on PATH even when the Odin source tree isn't reachable, so
+the CLI is the reliable discovery path.
 
 The protocol section is generated from `contract.build_system_prompt`, so what
 the guide documents and what Odin actually injects can never drift apart.
@@ -17,11 +18,14 @@ from .contract import build_system_prompt
 _INTRO = """\
 # Authoring tasks for Odin
 
-Odin runs a queue of tasks through Claude Code (`claude -p`), one at a time,
-each in a fresh session, carrying context forward and pausing for input. Your
-job as the author is to produce two things: a **queue of task files** and
-(optionally) a **CLAUDE.md** with your project's workflow rules. This guide is
-everything you need to do that.
+Odin runs a queue of tasks through a headless agent CLI — Claude Code
+(`claude -p`) by default, or Cursor Agent (`agent -p`) with
+`--platform cursor` — one at a time, each in a fresh session, carrying
+context forward and pausing for input. Your job as the author is to produce
+two things: a **queue of task files** and (optionally) a **project
+instruction file** with your workflow rules (`CLAUDE.md` for Claude,
+`AGENTS.md` / `.cursor/rules` for Cursor). This guide is everything you
+need to do that.
 """
 
 _QUEUE = """\
@@ -127,16 +131,101 @@ Paste this marker block:
 Odin's injected protocol takes precedence over the project's CLAUDE.md for task
 termination and git/branch/PR policy, so the marker mainly keeps a human reader
 (and any non-Odin run of the agent) from being surprised.
+
+For Cursor (`--platform cursor`), the equivalent file is **AGENTS.md** — see
+`odin guide agent-md`.
+"""
+
+_AGENT_MD = """\
+## 3b. Target project instructions for Cursor (AGENTS.md)
+
+When you run with `--platform cursor`, Odin looks for Cursor's instruction
+files instead of CLAUDE.md:
+
+| Platform | Instruction paths | Missing warn when… |
+|----------|-------------------|--------------------|
+| `claude` | `CLAUDE.md` | no `CLAUDE.md` |
+| `cursor` | `AGENTS.md`, `.cursor/rules` | neither exists |
+
+- **AGENTS.md alone** is enough — no spurious CLAUDE.md warning.
+- **`.cursor/rules/` alone** also suppresses the missing-instruction warn.
+- Claude ignores AGENTS.md for missing/conflict lint; Cursor ignores CLAUDE.md.
+
+Odin **injects the protocol for you** (see §4) by prepending it to the Cursor
+prompt, so AGENTS.md does NOT need to teach the sentinel blocks. It should own
+the **workflow** — same rules as CLAUDE.md, different file. A good minimal
+section:
+
+    ## Workflow (rules for tasks run by Odin)
+
+    - Test-to-green where tests exist: run them before declaring a task done.
+      Don't disable tests, loosen assertions, or use `--no-verify`.
+    - One task = one focused change. Don't sneak in refactors the task body
+      didn't ask for.
+    - Commit policy is yours: Odin positions the branch (or skips git) but
+      never commits itself. If you commit, do it only when tests are green.
+    - No partial work: if you can't finish safely, emit NEEDS_INPUT and leave
+      the tree clean.
+
+Paste this marker near the top of AGENTS.md:
+
+    ## This project is run by Odin
+
+    Tasks here are executed by Odin, a headless orchestrator. When a task runs:
+    - **Git is batch-managed.** The whole task queue runs on ONE branch. Commit
+      your work to the current branch when a task is done; do NOT create or
+      switch branches, push, or open pull requests.
+    - **Don't manage the queue.** Odin decides task order and feeds you the
+      context you need; never look for "the next task" yourself.
+    - **End every task** with exactly one Odin sentinel block (run
+      `odin guide protocol` for the exact contract).
+
+### Cross-platform layout
+
+If the same project may run under either Claude or Cursor, keep workflow in
+one place and point the other file at it:
+
+    myproject/
+    ├── AGENTS.md          # workflow rules (platform-neutral source of truth)
+    ├── CLAUDE.md          # "Follow AGENTS.md for workflow."
+    ├── .cursor/rules/     # optional scoped Cursor rules
+    └── queue/...
+
+A focused pasteable snippet lives at `examples/target-agents-md-snippet.md`
+(Claude equivalent: `examples/target-claude-md-snippet.md`).
+
+### Running under Cursor
+
+    odin run <name> --platform cursor
+    # or set a default once:
+    odin config set default_platform cursor
+
+`--agent-bin` overrides the Cursor `agent` binary; Claude keeps using
+`--claude-bin`. See `odin run -h` for Cursor-only flags (`--sandbox`,
+`--approve-mcps`, `--force`, `--trust`).
 """
 
 
-def _protocol_section() -> str:
-    return (
+def _protocol_section(*, platform: str | None = None) -> str:
+    heading = (
         "## 4. The protocol Odin injects (reference — you don't write this)\n\n"
-        "Odin appends the following contract to every task's system prompt. It "
-        "is shown here so you understand how a task ends and how questions are "
-        "shaped — and so a task body can rely on it:\n\n"
-        + _indent_block(build_system_prompt(None))
+    )
+    if platform == "cursor":
+        note = (
+            "Shown with Cursor wording (`AGENTS.md`). The Claude default "
+            "substitutes `CLAUDE.md` — same protocol, different instruction "
+            "file name. Odin prepends this contract to every Cursor task "
+            "prompt:\n\n"
+        )
+    else:
+        note = (
+            "Shown with Claude wording (`CLAUDE.md`); Cursor runs get "
+            "`AGENTS.md` via `--platform cursor`. Odin injects the following "
+            "contract into every task (Claude: `--append-system-prompt`; "
+            "Cursor: prepended to the prompt):\n\n"
+        )
+    return heading + note + _indent_block(
+        build_system_prompt(None, platform=platform)
     )
 
 
@@ -281,9 +370,11 @@ _RUN = """\
     odin status <name>                 # drill into one (bare name works here too)
 
 A natural pattern is one branch per batch: `odin run queue/<name> --branch
-<name>`. See `odin run -h` for branch selection (`--branch`/`--base`/`--no-git`),
-permissions (`--allowed-tools`), and limits (`--max-tasks`). Run `odin demo
-DIR` to scaffold a complete working example you can study and run.
+<name>`. See `odin run -h` for platform selection (`--platform`/`--model`),
+branch selection (`--branch`/`--base`/`--no-git`), permissions
+(`--allowed-tools`), and limits (`--max-tasks`). Run `odin demo DIR` to
+scaffold a complete working example you can study and run (Claude-only for
+v1; see the demo readme for a manual Cursor smoke-test).
 
 On a TTY the Odin tab shows live status (title + progress bar; `--notify` adds
 iTerm2 attention/color), so you can leave a batch running and glance over.
@@ -296,7 +387,9 @@ def _section(name: str) -> str:
         "queue": _QUEUE,
         "task": _TASK_BODY,
         "claude-md": _CLAUDE_MD,
+        "agent-md": _AGENT_MD,
         "protocol": _protocol_section(),
+        "protocol-cursor": _protocol_section(platform="cursor"),
         "flow": _FLOW,
         "run": _RUN,
         "terminal": _TERMINAL,
@@ -306,6 +399,7 @@ def _section(name: str) -> str:
 TOPICS = {
     "tasks": ("queue", "task", "flow", "run"),
     "claude-md": ("claude-md", "protocol"),
+    "agent-md": ("agent-md", "protocol-cursor"),
     "protocol": ("protocol",),
     "terminal": ("terminal",),
 }
@@ -315,11 +409,17 @@ def render(topic: str | None = None) -> str:
     """Return the guide text. `topic` None/"all" → the full manual; otherwise a
     focused subset (see TOPICS). Unknown topics fall back to the full manual."""
     if topic in (None, "all"):
-        parts = [_INTRO, _QUEUE, _TASK_BODY, _CLAUDE_MD, _protocol_section(), _FLOW, _RUN, _TERMINAL]
+        parts = [
+            _INTRO, _QUEUE, _TASK_BODY, _CLAUDE_MD, _AGENT_MD,
+            _protocol_section(), _FLOW, _RUN, _TERMINAL,
+        ]
     else:
         names = TOPICS.get(topic)
         if names is None:
-            parts = [_INTRO, _QUEUE, _TASK_BODY, _CLAUDE_MD, _protocol_section(), _FLOW, _RUN, _TERMINAL]
+            parts = [
+                _INTRO, _QUEUE, _TASK_BODY, _CLAUDE_MD, _AGENT_MD,
+                _protocol_section(), _FLOW, _RUN, _TERMINAL,
+            ]
         else:
             parts = [_section(n) for n in names]
     return "\n\n".join(p.strip() for p in parts) + "\n"

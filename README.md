@@ -1,43 +1,50 @@
 # Odin
 
-> Headless [Claude Code](https://code.claude.com/docs) task orchestrator — runs a queue of tasks through `claude -p`, one at a time, each in a fresh session.
+> Headless multi-platform task orchestrator — runs a queue of tasks through
+> [Claude Code](https://code.claude.com/docs) (`claude -p`) or
+> [Cursor Agent](https://cursor.com) (`agent -p`), one at a time, each in a
+> fresh session.
 
 <p align="center">
-  <img src="assets/odin-diagram.webp" alt="How Odin works: an AI agent reads the guide and authors a task queue; Odin runs one task at a time in a fresh Claude session, carrying context forward; each task either completes and moves to the next, needs input (you answer, it resumes), or fails — until the queue is complete." width="840">
+  <img src="assets/odin-diagram.webp" alt="How Odin works: an AI agent reads the guide and authors a task queue; Odin runs one task at a time in a fresh agent session, carrying context forward; each task either completes and moves to the next, needs input (you answer, it resumes), or fails — until the queue is complete." width="840">
 </p>
 
-Odin feeds a queue of task files into Claude Code running headless in a target
+Odin feeds a queue of task files into a headless agent CLI in a target
 project, **one task at a time, each in a fresh session**. It carries context
 forward between tasks, runs the whole batch on a single branch, and stops
 cleanly to ask you a question when the agent hits a decision it shouldn't guess.
+Default platform is Claude Code; pass `--platform cursor` (or set
+`default_platform` via `odin config`) to drive Cursor Agent instead.
 
 It stays deliberately dumb: Odin owns *sequencing* and the small *protocol* it
-needs to read the agent's output. Your project's `CLAUDE.md` owns the *workflow*
-(when to test, commit, branch). Zero runtime dependencies — Python stdlib only.
+needs to read the agent's output. Your project's instruction file
+(`CLAUDE.md` or `AGENTS.md`) owns the *workflow* (when to test, commit,
+branch). Zero runtime dependencies — Python stdlib only.
 
 ## Who it's for
 
-Developers who use Claude Code and have a batch of well-scoped tasks to run
-unattended — refactors, scaffolding, migrations, follow-the-recipe changes —
-and want them executed in sequence with context carried forward, instead of
-babysitting one prompt at a time.
+Developers who use Claude Code or Cursor Agent and have a batch of well-scoped
+tasks to run unattended — refactors, scaffolding, migrations, follow-the-recipe
+changes — and want them executed in sequence with context carried forward,
+instead of babysitting one prompt at a time.
 
 ## How it works
 
 1. You write one Markdown file per task into `queue/<batch>/pending/` — the file
    body *is* the prompt.
 2. `odin run` verifies a clean tree, picks one branch for the batch, then runs
-   each task through `claude -p` in your project — fresh session, picking up
-   your `CLAUDE.md`.
+   each task through the selected agent CLI (`claude -p` or `agent -p`) in your
+   project — fresh session, picking up your `CLAUDE.md` / `AGENTS.md`.
 3. Each task ends with a hidden sentinel: **done** (Odin carries its hand-off
    note into the next task) or **needs input** (Odin shows you the question and
    waits for an answer).
-4. The agent commits per your `CLAUDE.md`; Odin never commits, pushes, or opens
-   PRs — it only positions the branch.
+4. The agent commits per your project instructions; Odin never commits, pushes,
+   or opens PRs — it only positions the branch.
 
 ## Install
 
-Requires [`uv`](https://docs.astral.sh/uv/) and the `claude` CLI on your `PATH`.
+Requires [`uv`](https://docs.astral.sh/uv/) and an agent CLI on your `PATH`
+(`claude` by default, or Cursor's `agent` when using `--platform cursor`).
 
 ```sh
 uv tool install --from 'git+https://github.com/hglattergotz/odin@stable' odin
@@ -72,7 +79,7 @@ or want to know what's happening under the hood.
 ## Authoring a queue yourself
 
 Prefer to drive it by hand? A queue is just Markdown files. From any project that
-has a `CLAUDE.md`:
+has a `CLAUDE.md` (or `AGENTS.md` for Cursor):
 
 ```sh
 cd ~/code/myproject
@@ -80,9 +87,10 @@ mkdir -p queue/add-search/pending
 # drop task files in, e.g. queue/add-search/pending/001-add-endpoint.md
 
 odin run add-search --branch add-search --base main
+# Cursor: odin run add-search --platform cursor --branch add-search --base main
 ```
 
-Each task runs in a fresh Claude session inside `myproject`, carries context to
+Each task runs in a fresh agent session inside `myproject`, carries context to
 the next, and lands on the `add-search` branch. When a task needs a decision,
 Odin shows the question right in your terminal — press Enter to take the
 recommendation or type an answer, and it continues. `odin status` shows where
@@ -125,11 +133,14 @@ odin run -h      # options for a subcommand
 odin guide       # full task-authoring manual (queue layout, task files, protocol)
 ```
 
-Commands: `run`, `status`, `resume`, `archive`, `metrics`, `guide`, `demo`.
+Commands: `run`, `status`, `resume`, `archive`, `metrics`, `guide`, `demo`,
+`config`.
 
 `odin guide` prints the full authoring manual — it's exactly what your agent
-reads in [Quickest start](#quickest-start--let-your-agent-set-it-up). To try the
-whole flow end-to-end on a throwaway project:
+reads in [Quickest start](#quickest-start--let-your-agent-set-it-up). Topics
+include `claude-md`, `agent-md` (Cursor / AGENTS.md), `protocol`, and
+`terminal`. To try the whole flow end-to-end on a throwaway project (Claude
+platform):
 
 ```sh
 odin demo /tmp/otest && cd /tmp/otest && odin run --no-git

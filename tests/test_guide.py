@@ -47,8 +47,35 @@ def test_topic_subsets():
     assert "<<<NEEDS_INPUT>>>" in cm  # includes protocol
     assert "This project is run by Odin" in cm  # pasteable marker block
 
+    am = render("agent-md")
+    assert "AGENTS.md" in am
+    assert ".cursor/rules" in am
+    assert "--platform cursor" in am
+    assert "<<<NEXT_CONTEXT>>>" in am  # includes Cursor-worded protocol
+    assert "AGENTS.md" in am
+    assert "This project is run by Odin" in am
+    # Cursor topic shows AGENTS.md in the injected contract, not CLAUDE.md
+    assert "project's AGENTS.md" in am
+    assert "## 1. The queue" not in am
+
     proto = render("protocol")
     assert "<<<NEXT_CONTEXT>>>" in proto
+
+
+def test_full_guide_covers_agent_md():
+    text = render()
+    assert "AGENTS.md" in text
+    assert "target-agents-md-snippet.md" in text
+    assert "--platform cursor" in text
+
+
+def test_cli_guide_agent_md(capsys):
+    rc = main(["guide", "agent-md"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "AGENTS.md" in out
+    assert ".cursor/rules" in out
+    assert "project's AGENTS.md" in out
 
 
 def test_terminal_topic_is_agent_executable():
