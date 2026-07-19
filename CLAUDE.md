@@ -46,7 +46,7 @@ odin/
 │   ├── cli.py           # argparse + entry point
 │   ├── queue.py         # filesystem queue model
 │   ├── runner.py        # generic agent subprocess loop + NDJSON parsing
-│   ├── backends/        # AgentBackend: claude.py, cursor.py, registry
+│   ├── backends/        # AgentBackend peers: claude, cursor, grok + registry
 │   ├── config.py        # ~/.odin/config.toml load/save + resolution
 │   ├── protocol.py      # sentinel markers + JSON question parsing
 │   ├── contract.py      # the protocol Odin injects via system prompt
@@ -71,8 +71,8 @@ odin/
 ## CLI surface
 
 ```
-odin run    [QUEUE_DIR] [--project PATH] [--platform {claude,cursor}] [--model MODEL]
-            [--claude-bin PATH] [--agent-bin PATH] [--max-tasks N]
+odin run    [QUEUE_DIR] [--project PATH] [--platform NAME] [--model MODEL]
+            [--agent-bin PATH] [--claude-bin PATH] [--max-tasks N]
             [--allowed-tools LIST] [--disallowed-tools LIST] [--permission-mode MODE]
             [--force] [--trust] [--sandbox MODE] [--approve-mcps]
             [--branch NAME] [--base NAME] [--no-git] [--no-metrics] [--no-title]
@@ -137,12 +137,15 @@ Defaults:
   via `cli._resolve_queue_arg`.
 - `--project` = current working directory
 - `--platform` = unset → `$ODIN_PLATFORM` → `default_platform` in config →
-  `claude`. `--model` = unset → `$ODIN_MODEL` → `platforms.<platform>.model`
+  `claude`. Registered peers: `claude`, `cursor`, `grok` (see
+  `docs/agent-backends.md`). Unknown names are a hard registry error.
+  `--model` = unset → `$ODIN_MODEL` → `platforms.<platform>.model`
   → platform CLI default (no `--model` flag emitted).
-- `--claude-bin` = `claude` (Claude only); `--agent-bin` = unset → config →
-  platform default (non-Claude platforms). Cursor autonomy flags
-  (`--force`/`--trust`/`--sandbox`/`--approve-mcps`) are ignored on Claude
-  with a warning; Claude tool/permission flags are ignored on Cursor.
+- `--agent-bin` = unset → config `platforms.<p>.binary` → backend default
+  (works for every platform). `--claude-bin` is a deprecated alias that only
+  applies when platform is `claude`. Cursor autonomy flags
+  (`--force`/`--trust`/`--sandbox`/`--approve-mcps`) are ignored on non-cursor
+  platforms with a warning.
 - `--permission-mode` = `bypassPermissions` — full autonomy by default (the
   agent runs all tools, incl. Bash, ungated). A headless agent that must stop
   for per-command approval can't work and thrashes. The safety net is the

@@ -214,7 +214,9 @@ class CursorBackend(AgentBackend):
         if etype == "result":
             # Terminal event (Appendix C.3): no stop_reason/cost/turns; carries
             # is_error, result text, session_id, camelCase usage, durations.
+            # Mark terminal so the generic loop does not hard-code type=="result".
             captured: CapturedFields = {
+                "terminal": True,
                 "final_text": event.get("result") or "",
                 "session_id": event.get("session_id"),
             }
@@ -230,6 +232,8 @@ class CursorBackend(AgentBackend):
         exit_code: int,
         wall_ms: int,
         stderr: str,
+        *,
+        accumulated_text: str = "",
     ) -> RunResult:
         """Turn the terminal `result` event (or its absence) into a `RunResult`.
 

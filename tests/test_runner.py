@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from odin.backends import ClaudeBackend, CursorBackend, RunOptions
+from odin.backends import ClaudeBackend, CursorBackend, GrokBackend, RunOptions
 from odin.runner import (
     _abbrev_path, _render_agent_text, _tool_detail, run_agent,
 )
@@ -524,3 +524,99 @@ def test_agent_argv_autonomy_and_optional_flags(
     # No claude-only flags leak into a cursor invocation.
     for flag in ("--append-system-prompt", "--permission-mode", "--verbose"):
         assert flag not in argv
+
+
+# ----------------------------------------------------------------------
+# GrokBackend via fake grok (file prompt + text deltas + terminal end)
+# ----------------------------------------------------------------------
+
+FAKE_GROK_SCRIPT = r"""#!/bin/sh
+# Record argv; assert --prompt-file exists and contains the task prompt.
+printf '%s\n' "$@" > "$ODIN_ARGS_FILE"
+prompt_file=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--prompt-file" ]; then prompt_file="$a"; fi
+  prev="$a"
+done
+if [ -z "$prompt_file" ] || [ ! -f "$prompt_file" ]; then
+  echo "missing --prompt-file" >&2
+  exit 2
+fi
+case "$FAKE_GROK_SCENARIO" in
+  completed)
+    printf '%s\n' '{"type":"text","data":"All done.\\n<<<NEXT_CONTEXT>>>\\n"}'
+    printf '%s\n' '{"type":"text","data":"Do task 2.\\n<<<END>>>"}'
+    printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-1","usage":{"input_tokens":3,"output_tokens":4},"total_cost_usd":0.01,"num_turns":2}'
+    exit 0
+    ;;
+  error_event)
+    printf '%s\n' '{"type":"text","data":"partial"}'
+    printf '%s\n' '{"type":"error","message":"boom"}'
+    exit 0
+    ;;
+  *)
+    echo "unknown scenario: $FAKE_GROK_SCENARIO" >&2
+    exit 99
+    ;;
+esac
+"""
+
+
+@pytest.fixture
+def fake_grok(tmp_path: Path) -> Path:
+    script = tmp_path / "fake-grok.sh"
+    script.write_text(FAKE_GROK_SCRIPT)
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+def test_grok_completed_accumulates_text_deltas(
+    fake_grok: Path, project_dir: Path, tmp_path: Path
+):
+    args_file = tmp_path / "grok-argv.txt"
+    os.environ["ODIN_ARGS_FILE"] = str(args_file)
+    os.environ["FAKE_GROK_SCENARIO"] = "completed"
+    try:
+        r = run_agent(
+            "do the thing",
+            project_dir,
+            GrokBackend(),
+            system_prompt="CONTRACT",
+            run_options=RunOptions(binary=str(fake_grok)),
+            out=io.StringIO(),
+        )
+    finally:
+        os.environ.pop("FAKE_GROK_SCENARIO", None)
+        os.environ.pop("ODIN_ARGS_FILE", None)
+    assert r.succeeded is True
+    assert r.platform == "grok"
+    assert "<<<NEXT_CONTEXT>>>" in r.final_text
+    assert "Do task 2." in r.final_text
+    assert r.session_id == "grok-1"
+    assert r.cost_usd == 0.01
+    argv = args_file.read_text().splitlines()
+    assert "--prompt-file" in argv
+    assert "--rules" in argv and "CONTRACT" in argv
+    assert "--output-format" in argv and "streaming-json" in argv
+    # Temp prompt file must be cleaned up by the loop.
+    pf = argv[argv.index("--prompt-file") + 1]
+    assert not Path(pf).exists()
+
+
+def test_grok_error_event_fails(fake_grok: Path, project_dir: Path, tmp_path: Path):
+    os.environ["ODIN_ARGS_FILE"] = str(tmp_path / "grok-argv.txt")
+    os.environ["FAKE_GROK_SCENARIO"] = "error_event"
+    try:
+        r = run_agent(
+            "do the thing",
+            project_dir,
+            GrokBackend(),
+            run_options=RunOptions(binary=str(fake_grok)),
+            out=io.StringIO(),
+        )
+    finally:
+        os.environ.pop("FAKE_GROK_SCENARIO", None)
+        os.environ.pop("ODIN_ARGS_FILE", None)
+    assert r.succeeded is False
+    assert r.error == "boom"

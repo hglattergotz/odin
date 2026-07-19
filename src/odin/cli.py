@@ -156,16 +156,15 @@ def _build_parser() -> argparse.ArgumentParser:
              "as a circuit-breaker against runaway sessions)",
     )
     run.add_argument(
-        "--claude-bin", default="claude",
-        help="path to the claude CLI (default: claude on PATH). Only used with "
-             "--platform claude; other platforms use --agent-bin.",
+        "--claude-bin", default=None,
+        help="deprecated alias for --agent-bin (kept for backward compatibility). "
+             "Prefer --agent-bin for every platform, including claude.",
     )
     run.add_argument(
         "--agent-bin", default=None,
-        help="path to the platform's agent CLI for non-claude platforms, e.g. "
-             "Cursor's `agent` (resolution: this flag → platforms.<platform>."
-             "binary in config → the platform default). Ignored (with a "
-             "warning) for --platform claude — use --claude-bin there.",
+        help="path to the agent CLI for the active platform (resolution: this "
+             "flag → --claude-bin alias → platforms.<platform>.binary in config "
+             "→ the platform default). Works for claude, cursor, grok, …",
     )
     run.add_argument(
         "--force", action="store_true",
@@ -194,9 +193,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--platform", default=None,
-        help="agent platform to run tasks through: claude or cursor "
-             "(resolution: this flag → $ODIN_PLATFORM → default_platform in "
-             "config → claude). Unknown names error clearly.",
+        help="agent platform to run tasks through (claude, cursor, grok, …; "
+             "resolution: this flag → $ODIN_PLATFORM → default_platform in "
+             "config → claude). Unknown names error clearly via the registry.",
     )
     run.add_argument(
         "--model", default=None,
@@ -433,11 +432,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # is enough) and --yes (scripts). Non-TTY gets a one-line info print and
     # continues; abort here exits 0 with no tasks / metrics / COMPLETED.md.
     if not args.dry_run and not args.yes:
-        is_claude = platform == "claude"
-        binary = (
-            (args.claude_bin if is_claude else args.agent_bin)
-            or backend.default_binary()
-        )
+        binary = _resolve_agent_binary(args, platform) or backend.default_binary()
         if not ask_run_confirmation(
             platform=platform,
             model=model,
@@ -504,12 +499,40 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _resolve_agent_binary(
+    args: argparse.Namespace, platform: str | None = None,
+) -> str | None:
+    """Resolve the agent CLI binary for any platform (peers, not Claude-special).
+
+    Order: ``--agent-bin`` → ``--claude-bin`` (deprecated; only when platform is
+    ``claude``) → None (backend / config default). ``--claude-bin`` on a
+    non-claude platform is ignored with a soft warning — use ``--agent-bin``.
+    """
+    agent = (args.agent_bin or "").strip() or None
+    claude_alias = (getattr(args, "claude_bin", None) or "").strip() or None
+    if agent:
+        if claude_alias and agent != claude_alias:
+            print(
+                "odin: warning — both --agent-bin and --claude-bin set; "
+                "using --agent-bin.",
+                file=sys.stderr,
+            )
+        return agent
+    if claude_alias:
+        if (platform or "claude") == "claude":
+            return claude_alias
+        print(
+            "odin: warning — --claude-bin is a deprecated alias for Claude; "
+            f"ignored for platform '{platform}'. Use --agent-bin.",
+            file=sys.stderr,
+        )
+    return None
+
+
 def _warn_ignored_platform_flags(args: argparse.Namespace, platform: str) -> None:
     """Soft-warn when a per-platform flag doesn't apply to the active platform
     (proposal §3: warn, never a hard error — the run proceeds without it)."""
     ignored: list[str] = []
-    if platform == "claude" and args.agent_bin:
-        ignored.append("--agent-bin")
     if platform != "cursor":
         if args.force:
             ignored.append("--force")
@@ -734,12 +757,9 @@ def _run_loop(
     """The task-processing loop. Records each task into `acc` and returns the
     process exit code; the caller writes the run summary."""
     completed = 0
-    # `--claude-bin` maps to the claude binary only; every other platform takes
-    # `--agent-bin` (proposal §3 flag table; None falls through to the
-    # platform's config/default binary). getattr default keeps backend=None
-    # (tests with run_agent mocked) on the historical claude path.
-    is_claude = getattr(backend, "name", "claude") == "claude"
-    binary = args.claude_bin if is_claude else args.agent_bin
+    # One binary override for every platform (--agent-bin; --claude-bin is a
+    # deprecated alias). None falls through to config / backend.default_binary().
+    binary = _resolve_agent_binary(args, getattr(backend, "name", None))
     # One frozen options bundle per run — every field is loop-invariant.
     run_options = RunOptions(
         binary=binary,
@@ -774,11 +794,18 @@ def _run_loop(
             # Preview the real invocation, sourced from the backend (never a
             # hard-coded `claude -p` — proposal C5), without spawning anything.
             spec = backend.build_invoke(prompt, project, system_prompt, run_options)
+            argv_preview = list(spec.argv)
+            if (spec.prompt_via or "stdin").strip().lower() == "file":
+                argv_preview += [
+                    spec.prompt_file_flag or "--prompt-file",
+                    "<temp-prompt-file>",
+                ]
             print(f"[dry-run] platform: {backend.name}")
-            print(f"[dry-run] would invoke: {_preview_argv(spec.argv)} "
+            print(f"[dry-run] prompt_via: {spec.prompt_via or 'stdin'}")
+            print(f"[dry-run] would invoke: {_preview_argv(argv_preview)} "
                   f"(cwd={spec.cwd})")
-            print(f"[dry-run] prompt ({len(prompt)} chars):")
-            print(_indent(prompt[:2000]))
+            print(f"[dry-run] prompt ({len(spec.prompt)} chars):")
+            print(_indent(_preview_prompt(spec.prompt)))
             return 0
 
         sig.task_start(completed)
@@ -1426,6 +1453,19 @@ def _preview_argv(argv: list[str], max_arg: int = 60) -> str:
         a = " ".join(a.split())
         parts.append(a if i == 0 or len(a) <= max_arg else a[: max_arg - 1] + "…")
     return " ".join(parts)
+
+
+def _preview_prompt(text: str, limit: int = 2000) -> str:
+    """Truncate a dry-run prompt preview, keeping head + tail when oversized.
+
+    Cursor prepends the protocol, so a head-only slice can hide the task body;
+    keeping the tail makes the actual task text visible in the preview.
+    """
+    if len(text) <= limit:
+        return text
+    head = limit * 3 // 4
+    tail = limit - head - 5
+    return text[:head] + "\n…\n" + text[-tail:]
 
 
 def _indent(text: str, prefix: str = "  | ") -> str:

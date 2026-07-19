@@ -732,19 +732,33 @@ def test_run_claude_warns_and_ignores_cursor_flags(setup, tmp_path, monkeypatch,
     rec = _arg_recorder(tmp_path / "recorder.sh", log)
     _seed_task(qdir, "001-a.md")
     rc = _run_cli(
-        ["run", str(qdir), "--project", str(project), "--claude-bin", str(rec),
-         "--agent-bin", "/some/agent", "--force", "--trust",
-         "--sandbox", "disabled", "--approve-mcps"],
+        ["run", str(qdir), "--project", str(project), "--agent-bin", str(rec),
+         "--force", "--trust", "--sandbox", "disabled", "--approve-mcps"],
     )
     assert rc == 0
     assert (qdir / "done" / "001-a.md").exists()
     err = capsys.readouterr().err
-    for flag in ("--agent-bin", "--force", "--trust", "--sandbox", "--approve-mcps"):
+    for flag in ("--force", "--trust", "--sandbox", "--approve-mcps"):
         assert flag in err
     assert "ignoring" in err
+    assert "--agent-bin" not in err  # universal binary flag — not platform-gated
     logged = log.read_text().splitlines()
     for flag in ("--force", "--trust", "--sandbox", "--approve-mcps"):
         assert flag not in logged
+
+
+def test_run_claude_agent_bin_overrides_binary(setup, tmp_path, monkeypatch):
+    """`--agent-bin` is the universal binary override, including for Claude."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    rec = _arg_recorder(tmp_path / "recorder.sh", log)
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--agent-bin", str(rec)],
+    )
+    assert rc == 0
+    assert (qdir / "done" / "001-a.md").exists()
 
 
 def test_dry_run_cursor_prints_agent_argv_not_claude(setup, monkeypatch, capsys):

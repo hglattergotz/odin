@@ -1,17 +1,22 @@
 """The `AgentBackend` interface and the value types backends exchange.
 
 A backend isolates everything platform-specific about driving a headless agent
-CLI. The generic subprocess loop (exec, stdin write, concurrent stderr drain,
-NDJSON line loop, wall-clock timing) stays in `runner.py`; a backend supplies
-only the three platform-specific pieces plus a little metadata:
+CLI. The generic subprocess loop (exec, prompt delivery, concurrent stderr
+drain, NDJSON line loop, wall-clock timing) stays in `runner.py`; a backend
+supplies only the platform-specific pieces plus a little metadata:
 
 - `build_invoke(...)`        — argv + final prompt text (prepend vs flag injection)
-- `handle_stream_event(...)` — live terminal rendering (tool lines differ per CLI)
-- `normalise_result(...)`    — token/cost/stop_reason/`succeeded` from the terminal event
+- `handle_stream_event(...)` — live terminal rendering; may mark terminal /
+  text deltas via returned `CapturedFields`
+- `normalise_result(...)`    — token/cost/stop_reason/`succeeded` from the
+  terminal event (+ optional accumulated stream text)
 - `default_binary()`         — the CLI name when the user passes no override
 - `instruction_files()`      — project instruction files, for startup warnings / lint
 
-See `docs/multi-platform-agents-proposal.md` §2.
+Every registered platform (Claude, Cursor, grok-build, …) is a peer that
+implements this same interface — there is no first-class backend in the loop.
+
+See `docs/multi-platform-agents-proposal.md` §2 and `docs/agent-backends.md`.
 """
 
 from __future__ import annotations
@@ -27,34 +32,42 @@ if TYPE_CHECKING:  # avoid an import cycle at runtime — runner imports nothing
 
 # A backend's stream handler may return a dict of fields captured from an event
 # (e.g. the session id from the init event), or None when an event contributes
-# nothing. It is primarily a live-display hook; the runner reads the terminal
-# `result` event itself and hands it to `normalise_result`. Kept as a plain
-# alias so backends can return ordinary dicts.
+# nothing. Recognised optional keys used by the generic loop:
+#   - ``terminal`` (truthy) — this event is the run's terminal event
+#   - ``text_delta`` (str)  — append to accumulated assistant text (CLIs that
+#     stream chunk deltas instead of a whole-message terminal field)
+#   - ``final_text`` / other keys — advisory for tests; ``normalise_result``
+#     still owns the RunResult
 CapturedFields = dict
 
 
 @dataclass(frozen=True)
 class AgentInvokeSpec:
-    """A fully-resolved invocation: what to exec, what to feed it on stdin, where.
+    """A fully-resolved invocation: what to exec, what prompt to feed, where.
 
-    `argv` is the binary plus all flags (it does NOT include the prompt as an
-    argument — the prompt is delivered on stdin via `prompt`). `cwd` is the
-    target project dir so the project's instruction file loads.
+    `prompt_via` selects how the generic loop delivers `prompt`:
+
+    - ``"stdin"`` (default) — write `prompt` on the child's stdin (Claude,
+      Cursor, and most CLIs).
+    - ``"file"`` — write `prompt` to a temp file and append
+      ``[prompt_file_flag, <path>]`` to `argv` (grok-build and similar).
+
+    `argv` must NOT already include the prompt-file flag when `prompt_via` is
+    ``"file"`` — the loop owns temp-file lifecycle and appends the flag.
     """
 
     argv: list[str]
     prompt: str
     cwd: Path
+    prompt_via: str = "stdin"  # "stdin" | "file"
+    prompt_file_flag: str = "--prompt-file"
 
 
 @dataclass(frozen=True)
 class RunOptions:
     """Platform-agnostic knobs the loop hands to `build_invoke`.
 
-    These mirror the keyword arguments `runner.run_claude` accepted before the
-    backend split, plus `model` (the platform-agnostic `--model`, proposal §3)
-    and the Cursor autonomy knobs (`sandbox`/`approve_mcps`, Batch B4). A
-    backend reads only the fields meaningful to it and ignores the rest.
+    A backend reads only the fields meaningful to it and ignores the rest.
     `sandbox` and `approve_mcps` are tri-state: None means "not set on the
     CLI", letting the backend fall back to its config section. Frozen — the
     loop builds one per run and never mutates it.
@@ -102,7 +115,11 @@ class AgentBackend(ABC):
         system_prompt: str | None,
         run_options: RunOptions,
     ) -> AgentInvokeSpec:
-        """Build the argv + final stdin prompt for one task invocation."""
+        """Build the argv + final prompt for one task invocation.
+
+        For ``prompt_via="file"`` backends, return argv *without* the
+        prompt-file flag; the loop creates the temp file and appends it.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -114,9 +131,11 @@ class AgentBackend(ABC):
     ) -> CapturedFields | None:
         """Render one NDJSON stream event live; return captured fields or None.
 
-        This is a live-display hook. The runner captures the terminal `result`
-        event on its own and passes it to `normalise_result`, so the return value
-        is advisory (handy for unit-testing what an event yields).
+        Return ``{"terminal": True, ...}`` when `event` is the run's terminal
+        event so the loop can hand it to `normalise_result` (do not assume the
+        event type is always ``"result"``). Return ``{"text_delta": "..."}``
+        when the CLI streams assistant text as chunk deltas that must be
+        concatenated into the final protocol-bearing text.
         """
         raise NotImplementedError
 
@@ -127,11 +146,15 @@ class AgentBackend(ABC):
         exit_code: int,
         wall_ms: int,
         stderr: str,
+        *,
+        accumulated_text: str = "",
     ) -> "RunResult":
         """Turn the terminal event (or its absence) into a `RunResult`.
 
         This is where the success gate lives — each platform decides `succeeded`
-        for itself (Claude keys off `stop_reason`; Cursor cannot). The runner
-        trusts `RunResult.succeeded` and never re-derives it.
+        for itself. `accumulated_text` is the concatenation of `text_delta`
+        captures from the stream (empty for CLIs that put the full text on the
+        terminal event). The runner trusts `RunResult.succeeded` and never
+        re-derives it.
         """
         raise NotImplementedError

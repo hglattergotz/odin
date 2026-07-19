@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from odin.backends import AgentBackend, ClaudeBackend, CursorBackend, get_backend
+from odin.backends import AgentBackend, ClaudeBackend, CursorBackend, GrokBackend, get_backend
 from odin.backends.base import AgentInvokeSpec, RunOptions
 from odin.backends.registry import DEFAULT_PLATFORM, available_platforms
 
@@ -66,6 +66,7 @@ def test_build_invoke_baseline_argv():
     spec = backend.build_invoke("the prompt", Path("/proj"), None, RunOptions())
     assert spec.prompt == "the prompt"        # prompt rides on stdin, unchanged
     assert spec.cwd == Path("/proj")
+    assert spec.prompt_via == "stdin"
     assert spec.argv[0] == "claude"           # default binary
     assert spec.argv[1] == "-p"
     assert "--output-format" in spec.argv and "stream-json" in spec.argv
@@ -224,6 +225,7 @@ def test_cursor_build_invoke_baseline_argv():
         assert flag not in spec.argv
     assert spec.prompt == "the prompt"        # no protocol → no prepend
     assert spec.cwd == Path("/proj")
+    assert spec.prompt_via == "stdin"
 
 
 def test_cursor_protocol_is_prepended_not_a_flag():
@@ -456,6 +458,119 @@ def test_cursor_stream_result_captures_fields():
 
     captured = CursorBackend().handle_stream_event(dict(_CURSOR_RESULT), io.StringIO())
     assert captured == {
+        "terminal": True,
         "final_text": "pong",
         "session_id": "7bfeef23-655d-4191-bdf4-61b9bdc0621f",
     }
+
+
+# ----------------------------------------------------------------------
+# GrokBackend (grok-build) — peer backend, file prompt + text deltas + end
+# ----------------------------------------------------------------------
+
+def test_grok_resolves_from_registry():
+    backend = get_backend("grok")
+    assert isinstance(backend, GrokBackend)
+    assert isinstance(backend, AgentBackend)
+    assert "grok" in available_platforms()
+
+
+def test_grok_metadata():
+    backend = GrokBackend()
+    assert backend.name == "grok"
+    assert backend.default_binary() == "grok"
+    assert backend.instruction_files() == [Path("CLAUDE.md")]
+
+
+def test_grok_build_invoke_file_prompt_and_flag_mapping():
+    opts = RunOptions(
+        binary="/opt/grok",
+        model="grok-model",
+        max_turns=3,
+        allowed_tools=["Read"],
+        disallowed_tools=["Bash"],
+        permission_mode="bypassPermissions",
+    )
+    spec = GrokBackend().build_invoke("task body", Path("/proj"), "CONTRACT", opts)
+    assert spec.prompt_via == "file"
+    assert spec.prompt_file_flag == "--prompt-file"
+    assert "--prompt-file" not in spec.argv  # loop appends the temp path
+    assert spec.argv[0] == "/opt/grok"
+    assert "--output-format" in spec.argv and "streaming-json" in spec.argv
+    assert "-p" not in spec.argv
+    assert spec.argv[spec.argv.index("--rules") + 1] == "CONTRACT"
+    assert spec.argv[spec.argv.index("--tools") + 1] == "Read"
+    assert spec.argv[spec.argv.index("--disallowed-tools") + 1] == "Bash"
+    assert spec.argv[spec.argv.index("--model") + 1] == "grok-model"
+    assert spec.argv[spec.argv.index("--max-turns") + 1] == "3"
+    assert spec.prompt == "task body"
+    assert "--append-system-prompt" not in spec.argv
+
+
+def test_grok_handle_text_delta_and_end_terminal():
+    import io
+
+    sink = io.StringIO()
+    backend = GrokBackend()
+    d1 = backend.handle_stream_event({"type": "text", "data": "Hello "}, sink)
+    d2 = backend.handle_stream_event({"type": "text", "data": "world"}, sink)
+    assert d1 == {"text_delta": "Hello "}
+    assert d2 == {"text_delta": "world"}
+    assert sink.getvalue() == "Hello world"
+    assert backend.handle_stream_event({"type": "thought", "data": "…"}, sink) is None
+    end = backend.handle_stream_event(
+        {
+            "type": "end",
+            "stopReason": "EndTurn",
+            "sessionId": "g-sess",
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+            "total_cost_usd": 0.01,
+            "num_turns": 4,
+        },
+        sink,
+    )
+    assert end["terminal"] is True
+    assert end["session_id"] == "g-sess"
+
+
+def test_grok_normalise_uses_accumulated_text():
+    backend = GrokBackend()
+    end = {
+        "type": "end",
+        "stopReason": "EndTurn",
+        "sessionId": "g1",
+        "usage": {"input_tokens": 9},
+        "total_cost_usd": 0.02,
+        "num_turns": 2,
+    }
+    text = "done\n<<<NEXT_CONTEXT>>>\nnext\n<<<END>>>"
+    r = backend.normalise_result(
+        end, exit_code=0, wall_ms=10, stderr="", accumulated_text=text,
+    )
+    assert r.succeeded is True
+    assert r.final_text == text
+    assert r.platform == "grok"
+    assert r.session_id == "g1"
+    assert r.cost_usd == 0.02
+    assert r.num_turns == 2
+    assert r.stop_reason == "EndTurn"
+
+
+def test_grok_normalise_error_event_fails():
+    backend = GrokBackend()
+    r = backend.normalise_result(
+        {"type": "error", "message": "nope"},
+        exit_code=0,
+        wall_ms=1,
+        stderr="",
+        accumulated_text="partial",
+    )
+    assert r.succeeded is False
+    assert r.error == "nope"
+
+
+def test_grok_normalise_missing_end_fails():
+    r = GrokBackend().normalise_result(
+        None, exit_code=0, wall_ms=1, stderr="", accumulated_text="x",
+    )
+    assert r.succeeded is False

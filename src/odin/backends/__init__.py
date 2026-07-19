@@ -2,13 +2,10 @@
 
 Odin's task loop is platform-agnostic. Each backend owns the few pieces that
 differ per agent CLI: how the invocation argv + prompt are built, how live
-stream events render, and how a terminal event normalises into a `RunResult`
-(including the success gate).
-
-This package is the *skeleton* introduced by Batch A1 of the multi-platform
-proposal (`docs/multi-platform-agents-proposal.md`). It changes no runtime
-behaviour on its own: `cli.py` and the live invoke path in `runner.py` are
-rewired to dispatch through a backend in later batches (A3/A4).
+stream events render (including which event is terminal / text deltas), and
+how a terminal event normalises into a `RunResult` (including the success
+gate). Claude, Cursor, and grok-build are peers registered in
+`odin.backends.registry`.
 """
 
 from __future__ import annotations
@@ -16,6 +13,7 @@ from __future__ import annotations
 from odin.backends.base import AgentBackend, AgentInvokeSpec, CapturedFields, RunOptions
 from odin.backends.claude import ClaudeBackend
 from odin.backends.cursor import CursorBackend
+from odin.backends.grok import GrokBackend
 from odin.backends.registry import get_backend
 
 __all__ = [
@@ -25,5 +23,6 @@ __all__ = [
     "RunOptions",
     "ClaudeBackend",
     "CursorBackend",
+    "GrokBackend",
     "get_backend",
 ]

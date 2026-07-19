@@ -5,6 +5,9 @@ turn a `--platform` value into an `AgentBackend`. New platforms register by
 adding an entry to `_BACKENDS`. Resolution is case-insensitive; an unknown name
 is a hard error (no silent fallback — a typo'd `--platform` should fail loudly,
 not quietly run Claude).
+
+Every registered backend is a peer: Claude is the *default*, not a privileged
+code path in the loop.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from __future__ import annotations
 from odin.backends.base import AgentBackend
 from odin.backends.claude import ClaudeBackend
 from odin.backends.cursor import CursorBackend
+from odin.backends.grok import GrokBackend
 
 #: The default platform when none is specified — preserves today's behaviour.
 DEFAULT_PLATFORM = "claude"
@@ -21,6 +25,7 @@ DEFAULT_PLATFORM = "claude"
 _BACKENDS: dict[str, type[AgentBackend]] = {
     "claude": ClaudeBackend,
     "cursor": CursorBackend,
+    "grok": GrokBackend,
 }
 
 

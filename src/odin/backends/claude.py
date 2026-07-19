@@ -121,7 +121,9 @@ class ClaudeBackend(AgentBackend):
             #   stop_reason: end_turn | max_turns | tool_use | ...
             #   is_error: bool
             #   session_id, usage, total_cost_usd
+            # Mark terminal so the generic loop does not hard-code type=="result".
             captured: CapturedFields = {
+                "terminal": True,
                 "final_text": event.get("result") or "",
                 "stop_reason": event.get("stop_reason"),
                 "session_id": event.get("session_id"),
@@ -138,6 +140,8 @@ class ClaudeBackend(AgentBackend):
         exit_code: int,
         wall_ms: int,
         stderr: str,
+        *,
+        accumulated_text: str = "",
     ) -> RunResult:
         """Turn the terminal `result` event (or its absence) into a `RunResult`.
 

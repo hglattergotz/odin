@@ -1,18 +1,20 @@
 """Generic headless-agent subprocess loop.
 
 Odin drives every agent CLI the same way: spawn it in headless streaming mode,
-feed the prompt on stdin (so we never deal with shell quoting), parse the NDJSON
-event stream line by line, surface assistant text and tool activity to the
-user's terminal as it arrives, and capture the terminal `result` event for the
-orchestrator to classify.
+deliver the prompt (stdin or temp file — per the backend's `AgentInvokeSpec`),
+parse the NDJSON event stream line by line, surface assistant text and tool
+activity to the user's terminal as it arrives, and hand the backend-marked
+terminal event to `normalise_result` for classification.
 
-Everything *platform-specific* — building the argv, rendering each stream event,
-and normalising the terminal event into a `RunResult` (including the success
-gate) — lives in an `AgentBackend` (see `odin.backends`). `run_agent` owns only
-the platform-agnostic machinery: process exec, the concurrent stderr drain,
-the NDJSON line loop, and wall-clock timing.
+Everything *platform-specific* — building the argv, how the prompt is framed,
+which events are terminal / text deltas, and normalising into a `RunResult`
+(including the success gate) — lives in an `AgentBackend` (see `odin.backends`).
+`run_agent` owns only the platform-agnostic machinery: process exec, prompt
+delivery, the concurrent stderr drain, the NDJSON line loop, and wall-clock
+timing.
 
-No retry, no resume — fresh session per call by design.
+No retry, no resume — fresh session per call by design. Claude is not special
+here; every backend is a peer.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -35,21 +38,21 @@ if TYPE_CHECKING:  # import only for typing — avoids loading the backends pack
 
 @dataclass(frozen=True)
 class RunResult:
-    succeeded: bool          # exit==0, no error event, stop_reason in good set
+    succeeded: bool          # backend-classified terminal outcome
     final_text: str          # text of the terminal assistant message — for protocol.parse
     stop_reason: str | None  # "end_turn", "max_turns", "error", ...
-    error: str | None        # error text from the result event, if any
+    error: str | None        # error text from the terminal/error event, if any
     exit_code: int
     session_id: str | None
     platform: str = "claude"  # which backend produced this result
-    # Metrics captured from the terminal `result` event + our own timing.
-    # All optional so a missing/older result event never breaks construction.
+    # Metrics captured from the terminal event + our own timing.
+    # All optional so a missing/older terminal event never breaks construction.
     wall_ms: int = 0                  # Odin-measured subprocess wall time
-    duration_ms: int | None = None    # Claude-reported total duration
-    api_ms: int | None = None         # Claude-reported API time
+    duration_ms: int | None = None    # agent-reported total duration
+    api_ms: int | None = None         # agent-reported API time
     num_turns: int | None = None      # turns the agent took
-    usage: dict | None = None         # raw token usage block
-    cost_usd: float | None = None     # total_cost_usd from the result event
+    usage: dict | None = None         # token usage block (backend-normalised or raw)
+    cost_usd: float | None = None     # total cost from the terminal event, if any
 
 
 def run_agent(
@@ -63,12 +66,13 @@ def run_agent(
 ) -> RunResult:
     """Run one task through `backend` in `project_dir`, returning its `RunResult`.
 
-    The platform-agnostic loop: ask the backend to build the invocation, exec it,
-    write the prompt on stdin, drain stderr concurrently, dispatch each NDJSON
-    event to the backend for live display, and hand the terminal `result` event
-    (or its absence) to the backend's `normalise_result` — which owns the success
-    gate. `out` defaults to sys.stdout; pass a sink for tests. Streaming display
-    is best-effort: we never let display failures break the run.
+    The platform-agnostic loop: ask the backend to build the invocation, deliver
+    the prompt (stdin or temp file), drain stderr concurrently, dispatch each
+    NDJSON event to the backend for live display / capture, and hand the
+    backend-marked terminal event (plus any accumulated text deltas) to
+    `normalise_result` — which owns the success gate. `out` defaults to
+    sys.stdout; pass a sink for tests. Streaming display is best-effort: we
+    never let display failures break the run.
     """
     if out is None:
         out = sys.stdout
@@ -82,71 +86,109 @@ def run_agent(
         raise FileNotFoundError(f"project dir does not exist: {project_dir}")
 
     spec = backend.build_invoke(prompt, project_dir, system_prompt, run_options)
+    prompt_via = (spec.prompt_via or "stdin").strip().lower()
+    if prompt_via not in ("stdin", "file"):
+        raise ValueError(
+            f"backend {backend.name!r} returned unknown prompt_via {spec.prompt_via!r}; "
+            f"expected 'stdin' or 'file'"
+        )
+
+    prompt_file: Path | None = None
+    argv = list(spec.argv)
+    stdin_text: str | None = None
+    if prompt_via == "file":
+        tf = tempfile.NamedTemporaryFile(
+            "w", suffix=".md", prefix="odin-prompt-", delete=False, encoding="utf-8",
+        )
+        try:
+            tf.write(spec.prompt)
+        finally:
+            tf.close()
+        prompt_file = Path(tf.name)
+        argv += [spec.prompt_file_flag or "--prompt-file", str(prompt_file)]
+    else:
+        stdin_text = spec.prompt
 
     start = time.monotonic()
-    proc = subprocess.Popen(
-        spec.argv,
-        cwd=str(spec.cwd),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
-    )
-    assert proc.stdin is not None and proc.stdout is not None
-
-    # Drain stderr on a background thread. If we only read stdout in the loop
-    # below and the child writes more than the OS pipe buffer (~64 KB) to
-    # stderr, the child blocks on that write and the whole session stalls —
-    # which the agent perceives as "tool outputs are delayed" and reacts to by
-    # spamming probe commands. Concurrent draining removes that back-pressure.
-    stderr_chunks: list[str] = []
-
-    def _drain_stderr() -> None:
-        if proc.stderr is not None:
-            for chunk in proc.stderr:
-                stderr_chunks.append(chunk)
-
-    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
-    stderr_thread.start()
-
     try:
-        proc.stdin.write(spec.prompt)
-        proc.stdin.close()
-    except BrokenPipeError:
-        # The CLI exited before reading our prompt; we'll see it via wait().
-        pass
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(spec.cwd),
+            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
 
-    # The terminal event (NDJSON `result`) carries the final text, stop info, and
-    # metrics. We dispatch every event to the backend for live display and keep
-    # the last `result`-typed event to hand to `normalise_result`. The terminal
-    # `result` event is the cross-platform NDJSON convention (proposal §6); a
-    # backend that needs different framing can ignore what we capture here.
-    terminal_event: dict | None = None
+        # Drain stderr on a background thread. If we only read stdout in the loop
+        # below and the child writes more than the OS pipe buffer (~64 KB) to
+        # stderr, the child blocks on that write and the whole session stalls —
+        # which the agent perceives as "tool outputs are delayed" and reacts to by
+        # spamming probe commands. Concurrent draining removes that back-pressure.
+        stderr_chunks: list[str] = []
 
-    for line in proc.stdout:
-        line = line.rstrip("\n")
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            _safe_write(out, "   " + style.dim(f"[non-JSON] {line}", out) + "\n")
-            continue
-        backend.handle_stream_event(event, out, project_dir)
-        if event.get("type") == "result":
-            terminal_event = event
+        def _drain_stderr() -> None:
+            if proc.stderr is not None:
+                for chunk in proc.stderr:
+                    stderr_chunks.append(chunk)
 
-    exit_code = proc.wait()
-    wall_ms = int((time.monotonic() - start) * 1000)
-    stderr_thread.join(timeout=5)
-    stderr_text = "".join(stderr_chunks)
-    if stderr_text.strip():
-        _safe_write(out, "   " + style.dim("[stderr]", out) + "\n")
-        for sline in stderr_text.rstrip("\n").split("\n"):
-            _safe_write(out, "   " + style.dim(sline, out) + "\n")
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
 
-    return backend.normalise_result(terminal_event, exit_code, wall_ms, stderr_text)
+        if stdin_text is not None and proc.stdin is not None:
+            try:
+                proc.stdin.write(stdin_text)
+                proc.stdin.close()
+            except BrokenPipeError:
+                # The CLI exited before reading our prompt; we'll see it via wait().
+                pass
+
+        # Backends mark the terminal event via CapturedFields["terminal"] and may
+        # stream assistant text as text_delta chunks (CLIs with no whole-message
+        # terminal field). The loop does not assume type == "result".
+        terminal_event: dict | None = None
+        text_parts: list[str] = []
+
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                _safe_write(out, "   " + style.dim(f"[non-JSON] {line}", out) + "\n")
+                continue
+            captured = backend.handle_stream_event(event, out, project_dir) or {}
+            delta = captured.get("text_delta")
+            if isinstance(delta, str) and delta:
+                text_parts.append(delta)
+            if captured.get("terminal"):
+                terminal_event = event
+
+        exit_code = proc.wait()
+        wall_ms = int((time.monotonic() - start) * 1000)
+        stderr_thread.join(timeout=5)
+        stderr_text = "".join(stderr_chunks)
+        if stderr_text.strip():
+            _safe_write(out, "   " + style.dim("[stderr]", out) + "\n")
+            for sline in stderr_text.rstrip("\n").split("\n"):
+                _safe_write(out, "   " + style.dim(sline, out) + "\n")
+
+        return backend.normalise_result(
+            terminal_event,
+            exit_code,
+            wall_ms,
+            stderr_text,
+            accumulated_text="".join(text_parts),
+        )
+    finally:
+        if prompt_file is not None:
+            try:
+                prompt_file.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ----------------------------------------------------------------------
@@ -173,10 +215,10 @@ def _assistant_text(event: dict) -> str:
 # ----------------------------------------------------------------------
 # display-only prettifying of the agent's message text
 # ----------------------------------------------------------------------
-# The protocol sentinel is parsed from the terminal `result` event (see
-# protocol.parse); what we print here is purely cosmetic. So we render Markdown
-# emphasis as ANSI (or strip the markers when color is off) and show the
-# <<<...>>> handoff fences as a clean, labelled, indented block.
+# The protocol sentinel is parsed from the terminal event / accumulated text
+# (see protocol.parse); what we print here is purely cosmetic. So we render
+# Markdown emphasis as ANSI (or strip the markers when color is off) and show
+# the <<<...>>> handoff fences as a clean, labelled, indented block.
 
 _SENTINEL_LABEL = {
     "NEXT_CONTEXT": "carry-forward to the next task",
@@ -206,7 +248,8 @@ def _render_agent_text(text: str, out: TextIO) -> str:
     Reformats the `<<<NEXT_CONTEXT>>> … <<<END>>>` handoff fences (and
     NEEDS_INPUT / FOLLOW_UP) into a dim, labelled, indented block — dropping the
     raw markers — and renders Markdown emphasis. Fenced code blocks pass through
-    untouched. The protocol itself is parsed from the `result` event, not this.
+    untouched. The protocol itself is parsed from the terminal/accumulated text,
+    not this.
     """
     rendered: list[str] = []
     in_code = in_sentinel = False
