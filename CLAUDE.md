@@ -3,15 +3,15 @@
 ## Purpose
 
 Odin is a minimal CLI that runs a queue of tasks through a headless agent
-CLI — **Claude Code** (`claude -p`) by default, or **Cursor Agent**
-(`agent -p`) with `--platform cursor` — one task at a time. It parses the
-structured output, carries context forward between tasks, and halts cleanly
-when the agent needs human input.
+CLI — **Claude Code** (`claude`) by default, **Cursor CLI** (`agent`) with
+`--platform cursor`, or **Grok Build** (`grok`) with `--platform grok` — one
+task at a time. It parses the structured output, carries context forward
+between tasks, and halts cleanly when the agent needs human input.
 
 Orchestration is intentionally dumb. Odin does not dictate workflow
 (clean-tree checks, branching, commits, tests). All of that lives in the
-**target project's** instruction file (`CLAUDE.md` for Claude, `AGENTS.md`
-/ `.cursor/rules` for Cursor). Odin's job is to invoke, observe, route, and
+**target project's** instruction file (`CLAUDE.md` for Claude Code, `AGENTS.md`
+/ `.cursor/rules` for Cursor CLI). Odin's job is to invoke, observe, route, and
 carry context. Snippets: `examples/target-claude-md-snippet.md` and
 `examples/target-agents-md-snippet.md`.
 
@@ -19,17 +19,20 @@ carry context. Snippets: `examples/target-claude-md-snippet.md` and
 
 The task loop (queue, carry-context, held/resume, follow-ups, git startup,
 terminal signaling, metrics shape) is platform-agnostic. Platform-specific
-pieces live behind an `AgentBackend` in `src/odin/backends/`:
+pieces live behind an `AgentBackend` in `src/odin/backends/`. Prefer **public
+product names** in docs; the short `--platform` key matches the binary:
 
-- **`ClaudeBackend`** — `claude -p`, protocol via `--append-system-prompt`,
-  success requires `stop_reason ∈ {end_turn, stop_sequence}`.
-- **`CursorBackend`** — `agent -p`, protocol prepended to the stdin prompt,
-  success ignores `stop_reason` (Cursor does not emit it).
+| Public product | `--platform` | Binary | Class |
+|----------------|--------------|--------|-------|
+| Claude Code | `claude` (default) | `claude` | `ClaudeBackend` |
+| Cursor CLI | `cursor` | `agent` | `CursorBackend` |
+| Grok Build | `grok` | `grok` | `GrokBackend` |
 
-`--platform` / `$ODIN_PLATFORM` / `default_platform` in config selects the
-backend; unknown names are a hard error. See
+See `docs/agent-backends.md` for invoke details. Design notes:
 `docs/multi-platform-agents-proposal.md`.
 
+`--platform` / `$ODIN_PLATFORM` / `default_platform` in config selects the
+backend; unknown names are a hard error.
 ## Language and layout
 
 Python 3.11+, **uv-managed**. Zero runtime dependencies (stdlib only).
@@ -372,7 +375,8 @@ uv tool install --from /path/to/odin odin
 # from inside any project
 cd ~/code/myproject
 odin run                       # uses ./queue, --project=$PWD, platform=claude
-odin run --platform cursor     # same queue through Cursor Agent
+odin run --platform cursor     # Cursor CLI (`agent`)
+odin run --platform grok       # Grok Build (`grok`)
 ```
 
 The agent subprocess runs with `cwd` set to `--project` (default `$PWD`), so

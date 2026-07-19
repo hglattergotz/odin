@@ -1,12 +1,16 @@
-"""`GrokBackend` — drives grok-build's headless CLI (`grok`).
+"""`GrokBackend` — drives **Grok Build** (xAI), binary `grok`.
 
-grok-build does **not** read the prompt from stdin. Odin writes the task prompt
+Public product: [Grok Build](https://docs.x.ai/build/overview).
+`--platform grok` selects this backend. This is **not** Cursor CLI with a
+Grok model (`--platform cursor --model …`).
+
+Grok Build does **not** read the prompt from stdin. Odin writes the task prompt
 to a temp file and the generic loop appends `--prompt-file <path>` (see
 `AgentInvokeSpec.prompt_via`). Assistant text arrives as ``{"type":"text",
 "data":…}`` chunk deltas (accumulated by the loop); the terminal event is
 ``{"type":"end", …}`` with camelCase ``stopReason``/``sessionId`` and
 snake_case ``usage.*`` (no ``cache_creation`` field). Protocol injection uses
-``--rules`` (grok's append-to-system-prompt); the tool allowlist flag is
+``--rules`` (Grok Build's append-to-system-prompt); the tool allowlist flag is
 ``--tools``.
 
 Success gate (mirrors the non-Claude predicate in the multi-platform proposal):
@@ -14,8 +18,7 @@ Success gate (mirrors the non-Claude predicate in the multi-platform proposal):
     succeeded = (exit_code == 0 and terminal_end_present
                  and error is None and bool(final_text))
 
-Verified against grok-build's streaming-json contract (see
-`docs/agent-backends.md`).
+See `docs/agent-backends.md`.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ from odin.runner import RunResult, _safe_write
 
 
 class GrokBackend(AgentBackend):
-    """Backend for the grok-build headless CLI (`grok`)."""
+    """Backend for xAI's Grok Build CLI (`grok`)."""
 
     name = "grok"
 
@@ -36,8 +39,8 @@ class GrokBackend(AgentBackend):
         return "grok"
 
     def instruction_files(self) -> list[Path]:
-        # grok-build historically followed Claude-shaped project instructions;
-        # warn on CLAUDE.md until a grok-specific convention is documented.
+        # Grok Build historically followed Claude-shaped project instructions;
+        # warn on CLAUDE.md until a Grok-specific convention is documented.
         return [Path("CLAUDE.md")]
 
     def build_invoke(
@@ -66,7 +69,7 @@ class GrokBackend(AgentBackend):
         if run_options.max_turns is not None:
             argv += ["--max-turns", str(run_options.max_turns)]
         if system_prompt:
-            # grok's append-to-system-prompt flag (alias: --append-system-prompt).
+            # Grok Build's append-to-system-prompt flag (alias: --append-system-prompt).
             argv += ["--rules", system_prompt]
         if run_options.allowed_tools:
             argv += ["--tools", ",".join(run_options.allowed_tools)]
@@ -130,7 +133,7 @@ class GrokBackend(AgentBackend):
         *,
         accumulated_text: str = "",
     ) -> RunResult:
-        """Classify a grok-build run from the `end`/`error` event + text deltas."""
+        """Classify a Grok Build run from the `end`/`error` event + text deltas."""
         final_text = accumulated_text or ""
         stop_reason: str | None = None
         error: str | None = None

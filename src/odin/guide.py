@@ -18,14 +18,15 @@ from .contract import build_system_prompt
 _INTRO = """\
 # Authoring tasks for Odin
 
-Odin runs a queue of tasks through a headless agent CLI — Claude Code
-(`claude -p`) by default, or Cursor Agent (`agent -p`) with
-`--platform cursor` — one at a time, each in a fresh session, carrying
-context forward and pausing for input. Your job as the author is to produce
-two things: a **queue of task files** and (optionally) a **project
-instruction file** with your workflow rules (`CLAUDE.md` for Claude,
-`AGENTS.md` / `.cursor/rules` for Cursor). This guide is everything you
-need to do that.
+Odin runs a queue of tasks through a headless agent CLI — **Claude Code**
+(`claude`) by default, **Cursor CLI** (`agent`) with `--platform cursor`, or
+**Grok Build** (`grok`) with `--platform grok` — one at a time, each in a
+fresh session, carrying context forward and pausing for input. Your job as
+the author is to produce two things: a **queue of task files** and
+(optionally) a **project instruction file** with your workflow rules
+(`CLAUDE.md` for Claude Code, `AGENTS.md` / `.cursor/rules` for Cursor CLI).
+See `odin guide agent-md` and `docs/agent-backends.md` for the product ↔
+platform map. This guide is everything you need to do that.
 """
 
 _QUEUE = """\
@@ -132,7 +133,7 @@ Odin's injected protocol takes precedence over the project's CLAUDE.md for task
 termination and git/branch/PR policy, so the marker mainly keeps a human reader
 (and any non-Odin run of the agent) from being surprised.
 
-For Cursor (`--platform cursor`), the equivalent file is **AGENTS.md** — see
+For Cursor CLI (`--platform cursor`), the equivalent file is **AGENTS.md** — see
 `odin guide agent-md`.
 """
 

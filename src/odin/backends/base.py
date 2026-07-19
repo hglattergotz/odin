@@ -13,7 +13,7 @@ supplies only the platform-specific pieces plus a little metadata:
 - `default_binary()`         — the CLI name when the user passes no override
 - `instruction_files()`      — project instruction files, for startup warnings / lint
 
-Every registered platform (Claude, Cursor, grok-build, …) is a peer that
+Every registered platform (Claude Code, Cursor CLI, Grok Build, …) is a peer that
 implements this same interface — there is no first-class backend in the loop.
 
 See `docs/multi-platform-agents-proposal.md` §2 and `docs/agent-backends.md`.
@@ -50,7 +50,7 @@ class AgentInvokeSpec:
     - ``"stdin"`` (default) — write `prompt` on the child's stdin (Claude,
       Cursor, and most CLIs).
     - ``"file"`` — write `prompt` to a temp file and append
-      ``[prompt_file_flag, <path>]`` to `argv` (grok-build and similar).
+      ``[prompt_file_flag, <path>]`` to `argv` (Grok Build and similar).
 
     `argv` must NOT already include the prompt-file flag when `prompt_via` is
     ``"file"`` — the loop owns temp-file lifecycle and appends the flag.

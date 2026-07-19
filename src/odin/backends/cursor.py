@@ -1,4 +1,7 @@
-"""`CursorBackend` — drives Cursor's headless agent CLI (`agent -p`).
+"""`CursorBackend` — drives **Cursor CLI**, binary `agent`.
+
+Public product: [Cursor CLI](https://cursor.com/docs/cli/overview).
+`--platform cursor` selects this backend.
 
 This owns the Cursor-specific pieces of an `odin run`: building the `agent -p`
 argv (autonomy flags, `--workspace`, optional `--model` / `--sandbox` /
@@ -104,7 +107,7 @@ def _norm_usage(raw: object) -> dict | None:
 
 
 class CursorBackend(AgentBackend):
-    """Backend for Cursor's headless agent CLI (`agent`)."""
+    """Backend for Cursor CLI (`agent`)."""
 
     name = "cursor"
 

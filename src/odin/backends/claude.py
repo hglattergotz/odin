@@ -1,4 +1,7 @@
-"""`ClaudeBackend` — drives `claude -p`, Odin's original (and default) platform.
+"""`ClaudeBackend` — drives **Claude Code** (Anthropic), binary `claude`.
+
+Public product: [Claude Code](https://code.claude.com/docs).
+`--platform claude` (the default) selects this backend.
 
 This owns the Claude-specific pieces of an `odin run`: building the `claude -p`
 argv (permission flags, `--append-system-prompt`, optional `--model` /

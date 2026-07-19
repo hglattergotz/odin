@@ -1,9 +1,10 @@
 # Odin
 
 > Headless multi-platform task orchestrator — runs a queue of tasks through
-> [Claude Code](https://code.claude.com/docs) (`claude -p`) or
-> [Cursor Agent](https://cursor.com) (`agent -p`), one at a time, each in a
-> fresh session.
+> [Claude Code](https://code.claude.com/docs) (`claude`),
+> [Cursor CLI](https://cursor.com/docs/cli/overview) (`agent`), or
+> [Grok Build](https://docs.x.ai/build/overview) (`grok`), one at a time, each
+> in a fresh session.
 
 <p align="center">
   <img src="assets/odin-diagram.webp" alt="How Odin works: an AI agent reads the guide and authors a task queue; Odin runs one task at a time in a fresh agent session, carrying context forward; each task either completes and moves to the next, needs input (you answer, it resumes), or fails — until the queue is complete." width="840">
@@ -13,8 +14,10 @@ Odin feeds a queue of task files into a headless agent CLI in a target
 project, **one task at a time, each in a fresh session**. It carries context
 forward between tasks, runs the whole batch on a single branch, and stops
 cleanly to ask you a question when the agent hits a decision it shouldn't guess.
-Default platform is Claude Code; pass `--platform cursor` (or set
-`default_platform` via `odin config`) to drive Cursor Agent instead.
+Default platform is **Claude Code**; pass `--platform cursor` for **Cursor CLI**
+or `--platform grok` for **Grok Build** (or set `default_platform` via
+`odin config`). See [`docs/agent-backends.md`](docs/agent-backends.md) for the
+product ↔ `--platform` ↔ binary map.
 
 It stays deliberately dumb: Odin owns *sequencing* and the small *protocol* it
 needs to read the agent's output. Your project's instruction file
@@ -23,18 +26,18 @@ branch). Zero runtime dependencies — Python stdlib only.
 
 ## Who it's for
 
-Developers who use Claude Code or Cursor Agent and have a batch of well-scoped
-tasks to run unattended — refactors, scaffolding, migrations, follow-the-recipe
-changes — and want them executed in sequence with context carried forward,
-instead of babysitting one prompt at a time.
+Developers who use Claude Code, Cursor CLI, or Grok Build and have a batch of
+well-scoped tasks to run unattended — refactors, scaffolding, migrations,
+follow-the-recipe changes — and want them executed in sequence with context
+carried forward, instead of babysitting one prompt at a time.
 
 ## How it works
 
 1. You write one Markdown file per task into `queue/<batch>/pending/` — the file
    body *is* the prompt.
 2. `odin run` verifies a clean tree, picks one branch for the batch, then runs
-   each task through the selected agent CLI (`claude -p` or `agent -p`) in your
-   project — fresh session, picking up your `CLAUDE.md` / `AGENTS.md`.
+   each task through the selected agent CLI (`claude`, `agent`, or `grok`) in
+   your project — fresh session, picking up your `CLAUDE.md` / `AGENTS.md`.
 3. Each task ends with a hidden sentinel: **done** (Odin carries its hand-off
    note into the next task) or **needs input** (Odin shows you the question and
    waits for an answer).
@@ -44,7 +47,7 @@ instead of babysitting one prompt at a time.
 ## Install
 
 Requires [`uv`](https://docs.astral.sh/uv/) and an agent CLI on your `PATH`
-(`claude` by default, or Cursor's `agent` when using `--platform cursor`).
+(`claude` for Claude Code, `agent` for Cursor CLI, or `grok` for Grok Build).
 
 ```sh
 uv tool install --from 'git+https://github.com/hglattergotz/odin@stable' odin
@@ -87,7 +90,8 @@ mkdir -p queue/add-search/pending
 # drop task files in, e.g. queue/add-search/pending/001-add-endpoint.md
 
 odin run add-search --branch add-search --base main
-# Cursor: odin run add-search --platform cursor --branch add-search --base main
+# Cursor CLI:  odin run add-search --platform cursor --branch add-search --base main
+# Grok Build:  odin run add-search --platform grok   --branch add-search --base main
 ```
 
 Each task runs in a fresh agent session inside `myproject`, carries context to

@@ -36,7 +36,7 @@ from odin.backends.registry import DEFAULT_PLATFORM
 MODEL_SUGGESTIONS: dict[str, list[str]] = {
     "claude": ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
     "cursor": ["composer-2.5-fast", "composer-2.5", "cursor-grok-4.5-high"],
-    "grok": [],  # free-text / unset — grok-build model ids drift with the CLI
+    "grok": [],  # free-text / unset — Grok Build model ids drift with the CLI
 }
 
 

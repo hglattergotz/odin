@@ -193,9 +193,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--platform", default=None,
-        help="agent platform to run tasks through (claude, cursor, grok, …; "
-             "resolution: this flag → $ODIN_PLATFORM → default_platform in "
-             "config → claude). Unknown names error clearly via the registry.",
+        help="agent platform: claude (Claude Code), cursor (Cursor CLI), "
+             "grok (Grok Build), … (resolution: this flag → $ODIN_PLATFORM → "
+             "default_platform in config → claude). See docs/agent-backends.md. "
+             "Unknown names error clearly via the registry.",
     )
     run.add_argument(
         "--model", default=None,
