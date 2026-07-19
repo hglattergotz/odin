@@ -87,6 +87,10 @@ def _seed_task(queue_dir: Path, name: str, body: str = "task body") -> None:
 
 
 def _run_cli(args: list[str], scenario: str | None = None) -> int:
+    # Claude-path tests historically omitted --platform; inject it so they stay
+    # explicit now that a missing platform is an error (no product default).
+    if args and args[0] == "run" and "--platform" not in args:
+        args = [*args, "--platform", "claude"]
     if scenario is not None:
         os.environ["FAKE_CLAUDE_SCENARIO"] = scenario
     try:
@@ -255,7 +259,7 @@ def test_no_subcommand_prints_help_not_error(capsys):
     # The overview explains what the queue is and what the input looks like.
     assert "queue/<name>/pending/" in out
     assert "NNN-slug.md" in out
-    assert "{run,status,resume,demo,guide,archive,metrics}" in out
+    assert "{run,status,resume,demo,guide,archive,metrics,config}" in out
 
 
 def test_status_lists_each_section(setup, capsys):
@@ -310,6 +314,72 @@ def test_run_missing_claude_md_warns_but_proceeds(setup, capsys):
     assert rc == 0
 
 
+def test_run_cursor_agents_md_only_no_spurious_claude_warning(
+    setup, tmp_path, monkeypatch, capsys
+):
+    """Acceptance: AGENTS.md-only project + --platform cursor → no CLAUDE.md warn."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    (project / "CLAUDE.md").unlink()
+    (project / "AGENTS.md").write_text("# cursor instructions\n")
+    rec = _cursor_recorder(
+        tmp_path / "fake-agent.sh", tmp_path / "argv.log", tmp_path / "stdin.log"
+    )
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--agent-bin", str(rec), "--no-git"],
+    )
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "CLAUDE.md" not in err
+    assert "not found" not in err
+    assert (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_cursor_missing_instructions_warns(setup, tmp_path, monkeypatch, capsys):
+    """Cursor with neither AGENTS.md nor .cursor/rules → missing-instruction warn."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    (project / "CLAUDE.md").unlink()
+    rec = _cursor_recorder(
+        tmp_path / "fake-agent.sh", tmp_path / "argv.log", tmp_path / "stdin.log"
+    )
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--agent-bin", str(rec), "--no-git"],
+    )
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "AGENTS.md" in err
+    assert ".cursor/rules" in err
+    assert "not found" in err or "none of" in err
+
+
+def test_run_cursor_rules_dir_alone_suppresses_missing_warn(
+    setup, tmp_path, monkeypatch, capsys
+):
+    """`.cursor/rules/` without AGENTS.md is enough for Cursor — no missing warn."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    (project / "CLAUDE.md").unlink()
+    (project / ".cursor" / "rules").mkdir(parents=True)
+    (project / ".cursor" / "rules" / "base.mdc").write_text("# rules\n")
+    rec = _cursor_recorder(
+        tmp_path / "fake-agent.sh", tmp_path / "argv.log", tmp_path / "stdin.log"
+    )
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--agent-bin", str(rec), "--no-git"],
+    )
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "not found" not in err
+    assert "none of" not in err
+
+
 def test_run_missing_project_dir_errors(setup):
     project, qdir, fake = setup
     _seed_task(qdir, "001-a.md")
@@ -339,6 +409,412 @@ def test_dry_run_prints_prompt_and_does_not_invoke(setup, capsys):
     # Nothing moved.
     assert (qdir / "pending" / "001-a.md").exists()
     assert not (qdir / "done" / "001-a.md").exists()
+
+
+# ----------------------------------------------------------------------
+# pre-run platform/model confirmation
+# ----------------------------------------------------------------------
+
+class _TTYConfirm(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def test_run_confirm_tty_yes_proceeds(setup, monkeypatch, capsys):
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    monkeypatch.setattr("sys.stdin", _TTYConfirm("\n"))  # empty = proceed
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake), "--no-git"],
+        scenario="completed",
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Odin will run this queue with:" in out
+    assert "platform:  claude" in out
+    assert "model:     (platform default)" in out
+    assert (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_confirm_tty_no_aborts_untouched(setup, monkeypatch, capsys):
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    monkeypatch.setattr("sys.stdin", _TTYConfirm("n\n"))
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake), "--no-git"],
+        scenario="completed",
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "odin: aborted." in out
+    assert (qdir / "pending" / "001-a.md").exists()
+    assert not (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_confirm_non_tty_info_line_proceeds(setup, capsys):
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    # pytest stdin is not a TTY → info line, no prompt wait.
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake), "--no-git"],
+        scenario="completed",
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "odin: platform=claude model=(platform default)" in out
+    assert "Proceed?" not in out
+    assert (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_confirm_yes_flag_skips_prompt_on_tty(setup, monkeypatch, capsys):
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    monkeypatch.setattr("sys.stdin", _TTYConfirm("n\n"))  # would abort if prompted
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake),
+         "--no-git", "--yes"],
+        scenario="completed",
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Proceed?" not in out
+    assert "odin: aborted." not in out
+    assert (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_confirm_dry_run_skips_prompt(setup, monkeypatch, capsys):
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md", "the task body")
+    monkeypatch.setattr("sys.stdin", _TTYConfirm("n\n"))  # would abort if prompted
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake),
+         "--dry-run"],
+        scenario="completed",
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[dry-run]" in out
+    assert "Proceed?" not in out
+    assert "odin: aborted." not in out
+    assert (qdir / "pending" / "001-a.md").exists()
+
+
+# ----------------------------------------------------------------------
+# platform / model selection (Batch A4)
+# ----------------------------------------------------------------------
+
+def test_run_platform_claude_explicit(setup, monkeypatch):
+    """`--platform claude` selects Claude Code and completes a task."""
+    monkeypatch.delenv("ODIN_PLATFORM", raising=False)
+    monkeypatch.delenv("ODIN_MODEL", raising=False)
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "claude", "--claude-bin", str(fake)],
+        scenario="completed",
+    )
+    assert rc == 0
+    assert (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_platform_required_when_unset(setup, monkeypatch, capsys):
+    """No --platform / env / config → hard error (no silent Claude default)."""
+    monkeypatch.delenv("ODIN_PLATFORM", raising=False)
+    monkeypatch.delenv("ODIN_MODEL", raising=False)
+    monkeypatch.delenv("ODIN_CONFIG", raising=False)
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    # Call main directly so the test helper does not inject --platform.
+    rc = main(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake),
+         "--no-git", "--dry-run"],
+    )
+    assert rc == 2
+    assert "platform is required" in capsys.readouterr().err
+
+
+def _arg_recorder(path: Path, log: Path) -> Path:
+    """A fake claude that records its argv to `log`, then emits a completed result."""
+    result = (
+        '{"type":"result","subtype":"success","stop_reason":"end_turn",'
+        '"is_error":false,"result":"<<<NEXT_CONTEXT>>>\\ndone\\n<<<END>>>"}'
+    )
+    path.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$@" > "{log}"\n'
+        "cat >/dev/null\n"
+        f"printf '%s\\n' '{result}'\n"
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def test_run_model_flag_passed_to_claude(setup, tmp_path, monkeypatch):
+    monkeypatch.delenv("ODIN_MODEL", raising=False)
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    rec = _arg_recorder(tmp_path / "recorder.sh", log)
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--claude-bin", str(rec), "--model", "claude-test-model"],
+    )
+    assert rc == 0
+    logged = log.read_text().splitlines()
+    assert "--model" in logged
+    assert "claude-test-model" in logged
+
+
+def test_run_no_model_emits_no_model_flag(setup, tmp_path, monkeypatch):
+    monkeypatch.delenv("ODIN_MODEL", raising=False)
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    rec = _arg_recorder(tmp_path / "recorder.sh", log)
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(rec)],
+    )
+    assert rc == 0
+    assert "--model" not in log.read_text().splitlines()
+
+
+def test_run_unknown_platform_errors_clearly(setup, capsys, monkeypatch):
+    """An unregistered `--platform` is a hard error before anything runs."""
+    monkeypatch.delenv("ODIN_PLATFORM", raising=False)
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "kiro", "--claude-bin", str(fake)],
+        scenario="completed",
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "unknown platform" in err
+    assert "kiro" in err
+    # Nothing ran — the task is untouched in pending/.
+    assert (qdir / "pending" / "001-a.md").exists()
+
+
+def test_run_model_from_env(setup, tmp_path, monkeypatch):
+    """$ODIN_MODEL supplies the model when no --model flag is given."""
+    monkeypatch.setenv("ODIN_MODEL", "env-model-id")
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    rec = _arg_recorder(tmp_path / "recorder.sh", log)
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(rec)],
+    )
+    assert rc == 0
+    logged = log.read_text().splitlines()
+    assert "--model" in logged
+    assert "env-model-id" in logged
+
+
+# ----------------------------------------------------------------------
+# --platform cursor wiring (Batch B1–B2)
+# ----------------------------------------------------------------------
+
+def _cursor_recorder(path: Path, log: Path, stdin_log: Path) -> Path:
+    """A fake `agent` that records argv + stdin, then emits a Cursor-shaped
+    terminal result (no stop_reason, camelCase usage) with a completed sentinel."""
+    result = (
+        '{"type":"result","subtype":"success","duration_ms":7,'
+        '"duration_api_ms":6,"is_error":false,'
+        '"result":"<<<NEXT_CONTEXT>>>\\ncursor carry\\n<<<END>>>",'
+        '"session_id":"sess-cursor","usage":{"inputTokens":11,"outputTokens":2,'
+        '"cacheReadTokens":3,"cacheWriteTokens":4}}'
+    )
+    path.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$@" > "{log}"\n'
+        f'cat > "{stdin_log}"\n'
+        f"printf '%s\\n' '{result}'\n"
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return path
+
+
+def test_run_platform_cursor_end_to_end(setup, tmp_path, monkeypatch):
+    """`--platform cursor` drives the agent CLI: cursor argv, protocol on
+    stdin (not a flag), --claude-bin ignored, and the task lands in done/."""
+    monkeypatch.delenv("ODIN_PLATFORM", raising=False)
+    monkeypatch.delenv("ODIN_MODEL", raising=False)
+    monkeypatch.delenv("ODIN_CONFIG", raising=False)
+    project, qdir, fake = setup
+    log = tmp_path / "argv.log"
+    stdin_log = tmp_path / "stdin.log"
+    rec = _cursor_recorder(tmp_path / "fake-agent.sh", log, stdin_log)
+    # Binary supplied via config here — the --agent-bin flag path is covered
+    # in the Batch B4–B5 section below.
+    home = Path(os.environ["ODIN_HOME"])
+    (home / "config.toml").write_text(
+        f'[platforms.cursor]\nbinary = "{rec}"\n', encoding="utf-8"
+    )
+    _seed_task(qdir, "001-a.md", "the cursor task body")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--claude-bin", str(fake)],
+    )
+    assert rc == 0
+    assert (qdir / "done" / "001-a.md").exists()
+    assert "cursor carry" in (qdir / "carry" / "001-a.next-context.md").read_text()
+    logged = log.read_text().splitlines()
+    assert "-p" in logged
+    assert "--force" in logged and "--trust" in logged
+    assert logged[logged.index("--workspace") + 1] == str(project)
+    # Protocol goes in via stdin prepend, never a flag; claude flags are absent.
+    for flag in ("--append-system-prompt", "--permission-mode", "--verbose"):
+        assert flag not in logged
+    stdin = stdin_log.read_text()
+    assert stdin.startswith("<!-- ODIN_PROTOCOL")
+    assert "<!-- END ODIN_PROTOCOL -->" in stdin
+    assert "the cursor task body" in stdin
+    assert stdin.index("END ODIN_PROTOCOL") < stdin.index("the cursor task body")
+
+
+# ----------------------------------------------------------------------
+# Cursor CLI flags + dry-run from build_invoke (Batch B4–B5)
+# ----------------------------------------------------------------------
+
+def _clean_platform_env(monkeypatch):
+    for var in ("ODIN_PLATFORM", "ODIN_MODEL", "ODIN_CONFIG"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_run_cursor_agent_bin_flag_end_to_end(setup, tmp_path, monkeypatch):
+    """Acceptance: --platform cursor + --agent-bin (no config needed) drives the
+    fake agent to a completed sentinel and the task lands in done/."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    stdin_log = tmp_path / "stdin.log"
+    rec = _cursor_recorder(tmp_path / "fake-agent.sh", log, stdin_log)
+    _seed_task(qdir, "001-a.md", "cursor flag task")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--agent-bin", str(rec)],
+    )
+    assert rc == 0
+    assert (qdir / "done" / "001-a.md").exists()
+    assert "cursor carry" in (qdir / "carry" / "001-a.next-context.md").read_text()
+    logged = log.read_text().splitlines()
+    # The recorder logs "$@" (no argv[0]) — it having run at all proves the
+    # --agent-bin flag picked the binary (no config supplied one).
+    assert "-p" in logged
+    assert "--force" in logged and "--trust" in logged
+
+
+def test_run_cursor_agent_bin_beats_config_binary(setup, tmp_path, monkeypatch):
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    rec = _cursor_recorder(tmp_path / "fake-agent.sh", log, tmp_path / "stdin.log")
+    home = Path(os.environ["ODIN_HOME"])
+    (home / "config.toml").write_text(
+        '[platforms.cursor]\nbinary = "/nonexistent/agent"\n', encoding="utf-8"
+    )
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--agent-bin", str(rec)],
+    )
+    assert rc == 0                 # the config binary would have crashed the run
+    assert (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_cursor_sandbox_and_approve_mcps_flags_forwarded(setup, tmp_path, monkeypatch):
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    rec = _cursor_recorder(tmp_path / "fake-agent.sh", log, tmp_path / "stdin.log")
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--agent-bin", str(rec),
+         "--force", "--trust", "--sandbox", "disabled", "--approve-mcps"],
+    )
+    assert rc == 0
+    logged = log.read_text().splitlines()
+    assert logged[logged.index("--sandbox") + 1] == "disabled"
+    assert "--approve-mcps" in logged
+    assert "--force" in logged and "--trust" in logged
+
+
+def test_run_claude_warns_and_ignores_cursor_flags(setup, tmp_path, monkeypatch, capsys):
+    """Cursor-only flags on the claude platform warn once and are
+    dropped — the run proceeds and the claude argv never sees them."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    rec = _arg_recorder(tmp_path / "recorder.sh", log)
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--agent-bin", str(rec),
+         "--force", "--trust", "--sandbox", "disabled", "--approve-mcps"],
+    )
+    assert rc == 0
+    assert (qdir / "done" / "001-a.md").exists()
+    err = capsys.readouterr().err
+    for flag in ("--force", "--trust", "--sandbox", "--approve-mcps"):
+        assert flag in err
+    assert "ignoring" in err
+    assert "--agent-bin" not in err  # universal binary flag — not platform-gated
+    logged = log.read_text().splitlines()
+    for flag in ("--force", "--trust", "--sandbox", "--approve-mcps"):
+        assert flag not in logged
+
+
+def test_run_claude_agent_bin_overrides_binary(setup, tmp_path, monkeypatch):
+    """`--agent-bin` is the universal binary override, including for Claude."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    log = tmp_path / "argv.log"
+    rec = _arg_recorder(tmp_path / "recorder.sh", log)
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--agent-bin", str(rec)],
+    )
+    assert rc == 0
+    assert (qdir / "done" / "001-a.md").exists()
+
+
+def test_dry_run_cursor_prints_agent_argv_not_claude(setup, monkeypatch, capsys):
+    """Dry-run sources the preview from backend.build_invoke (proposal C5)."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    _seed_task(qdir, "001-a.md", "the cursor dry body")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project), "--platform", "cursor",
+         "--agent-bin", "/opt/cursor/agent", "--sandbox", "disabled", "--dry-run"],
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[dry-run] platform: cursor" in out
+    assert "/opt/cursor/agent" in out
+    assert "--workspace" in out and "--force" in out and "--trust" in out
+    assert "--sandbox disabled" in out
+    assert "claude" not in out.split("would invoke:")[1].splitlines()[0]
+    assert "the cursor dry body" in out
+    # Nothing moved, nothing invoked (the binary doesn't even exist).
+    assert (qdir / "pending" / "001-a.md").exists()
+
+
+def test_dry_run_claude_prints_backend_argv(setup, monkeypatch, capsys):
+    _clean_platform_env(monkeypatch)
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--claude-bin", str(fake), "--dry-run"],
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[dry-run] platform: claude" in out
+    assert str(fake) in out                     # the resolved binary, not "claude"
+    assert "--permission-mode bypassPermissions" in out
 
 
 # ----------------------------------------------------------------------
@@ -410,6 +886,30 @@ def test_run_warns_on_conflicting_claude_md_but_proceeds(setup, capsys):
     assert (qdir / "done" / "001-a.md").exists()
 
 
+def test_run_warns_on_conflicting_agents_md_but_proceeds(
+    setup, tmp_path, monkeypatch, capsys
+):
+    """Cursor platform scans AGENTS.md (not CLAUDE.md) for git-workflow conflicts."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    (project / "CLAUDE.md").unlink()
+    (project / "AGENTS.md").write_text("# proj\nAlways open a pull request per task.\n")
+    _init_repo(project)
+    rec = _cursor_recorder(
+        tmp_path / "fake-agent.sh", tmp_path / "argv.log", tmp_path / "stdin.log"
+    )
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--agent-bin", str(rec), "--branch", "main"],
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "pull request" in err
+    assert "AGENTS.md" in err
+    assert (qdir / "done" / "001-a.md").exists()
+
+
 def test_run_non_git_project_warns_but_proceeds(setup, capsys):
     project, qdir, fake = setup  # project is not a git repo
     _seed_task(qdir, "001-a.md")
@@ -436,10 +936,12 @@ def test_interactive_held_answers_and_continues(setup, monkeypatch, tmp_path):
     state = tmp_path / "state"
     monkeypatch.setenv("ODIN_STATE_FILE", str(state))
     # Pretend we're on a TTY and answer the single question with option "a".
+    # --yes skips the pre-run confirm so stdin is only for the held Q&A.
     monkeypatch.setattr("sys.stdin", _TTYStdin("a\n"))
 
     rc = _run_cli(
-        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake), "--no-git"],
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake),
+         "--no-git", "--yes"],
         scenario="held_json_then_done",
     )
     assert rc == 0
@@ -515,9 +1017,11 @@ def test_followup_urgent_tty_continue_runs_it_next(setup, monkeypatch, tmp_path)
     project, qdir, fake = setup
     _seed_task(qdir, "001-a.md")
     monkeypatch.setenv("ODIN_STATE_FILE", str(tmp_path / "state"))
+    # --yes skips the pre-run confirm so stdin is only for ask_continue.
     monkeypatch.setattr("sys.stdin", _TTYStdinFollow("c\n"))  # answer "continue"
     rc = _run_cli(
-        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake), "--no-git"],
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake),
+         "--no-git", "--yes"],
         scenario="followup_urgent_once",
     )
     assert rc == 0
@@ -701,3 +1205,59 @@ def test_run_on_container_errors_without_creating(setup, tmp_path, capsys):
     assert rc == 2
     assert "holds sub-queues" in capsys.readouterr().err
     assert not (container / "pending").exists()
+
+
+# ----- odin config ---------------------------------------------------
+
+def test_config_set_get_round_trip(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "config.toml"
+    monkeypatch.setenv("ODIN_CONFIG", str(cfg))
+    assert main(["config", "set", "platforms.claude.model", "sonnet"]) == 0
+    capsys.readouterr()
+    assert main(["config", "get", "platforms.claude.model"]) == 0
+    assert capsys.readouterr().out.strip() == "sonnet"
+    assert cfg.read_text() == (
+        "[platforms.claude]\n"
+        'model = "sonnet"\n'
+    )
+
+
+def test_config_get_missing_key_returns_1(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ODIN_CONFIG", str(tmp_path / "config.toml"))
+    assert main(["config", "get", "platforms.claude.model"]) == 1
+    assert "key not set" in capsys.readouterr().err
+
+
+def test_config_show_includes_effective(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "config.toml"
+    monkeypatch.setenv("ODIN_CONFIG", str(cfg))
+    monkeypatch.delenv("ODIN_PLATFORM", raising=False)
+    monkeypatch.delenv("ODIN_MODEL", raising=False)
+    main(["config", "set", "default_platform", "claude"])
+    capsys.readouterr()
+    assert main(["config", "show"]) == 0
+    out = capsys.readouterr().out
+    assert "effective platform: claude" in out
+    assert "effective model:    (platform default)" in out
+
+
+def test_config_show_unset_platform(tmp_path, monkeypatch, capsys):
+    cfg = tmp_path / "config.toml"
+    monkeypatch.setenv("ODIN_CONFIG", str(cfg))
+    monkeypatch.delenv("ODIN_PLATFORM", raising=False)
+    assert main(["config", "show"]) == 0
+    out = capsys.readouterr().out
+    assert "effective platform: (unset" in out
+
+
+def test_config_set_coerces_bool(tmp_path, monkeypatch):
+    cfg = tmp_path / "config.toml"
+    monkeypatch.setenv("ODIN_CONFIG", str(cfg))
+    main(["config", "set", "platforms.claude.verbose", "true"])
+    assert "verbose = true" in cfg.read_text()
+
+
+def test_config_get_usage_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ODIN_CONFIG", str(tmp_path / "config.toml"))
+    assert main(["config", "get"]) == 2
+    assert "usage" in capsys.readouterr().err

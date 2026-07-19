@@ -44,6 +44,24 @@ SCHEMA_VERSION = 1
 
 _TOKEN_KEYS = ("input", "output", "cache_creation", "cache_read")
 
+# Default Claude CLI usage-field names → Odin's internal token keys. Used when
+# the usage dict is still raw (ClaudeBackend passes it through) and no
+# `[platforms.<p>.metrics]` config override is present.
+_DEFAULT_USAGE_RAW = {
+    "input": "input_tokens",
+    "output": "output_tokens",
+    "cache_creation": "cache_creation_input_tokens",
+    "cache_read": "cache_read_input_tokens",
+}
+
+# Config keys under `[platforms.<p>.metrics]` that rename CLI fields → internal.
+_METRICS_USAGE_CFG = {
+    "input": "usage_input",
+    "output": "usage_output",
+    "cache_creation": "usage_cache_write",
+    "cache_read": "usage_cache_read",
+}
+
 
 # ----------------------------------------------------------------------
 # location / config
@@ -107,15 +125,61 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _norm_usage(usage: object) -> dict:
-    """Normalise Claude's `usage` block to Odin's stable token keys."""
+def _usage_raw_map(platform: str | None = None) -> dict[str, str]:
+    """Map Odin internal token keys → raw CLI field names for `platform`.
+
+    Reads `[platforms.<platform>.metrics]` when present; falls back to the
+    Claude defaults. Best-effort — a bad config never raises.
+    """
+    mapping = dict(_DEFAULT_USAGE_RAW)
+    if not platform:
+        return mapping
+    try:
+        from odin import config as odin_config
+        metrics_cfg = odin_config.get_in(
+            odin_config.load_config(), f"platforms.{platform}.metrics"
+        )
+        if not isinstance(metrics_cfg, dict):
+            return mapping
+        for internal, cfg_key in _METRICS_USAGE_CFG.items():
+            raw = metrics_cfg.get(cfg_key)
+            if isinstance(raw, str) and raw.strip():
+                mapping[internal] = raw.strip()
+    except Exception:
+        pass
+    return mapping
+
+
+def _norm_usage(usage: object, *, platform: str | None = None) -> dict:
+    """Normalise a usage block to Odin's stable token keys.
+
+    Accepts either:
+      - a backend-normalised dict already keyed by ``input`` / ``output`` /
+        ``cache_read`` / ``cache_creation`` (CursorBackend; pass-through), or
+      - a raw CLI usage block, mapped via ``[platforms.<p>.metrics]`` config
+        (or the Claude defaults when config is absent).
+    """
     u = usage if isinstance(usage, dict) else {}
-    return {
-        "input": u.get("input_tokens"),
-        "output": u.get("output_tokens"),
-        "cache_creation": u.get("cache_creation_input_tokens"),
-        "cache_read": u.get("cache_read_input_tokens"),
-    }
+    # Already normalised by a backend? Prefer those keys so cursor token
+    # counts aren't wiped by a Claude-shaped remap.
+    if any(k in u for k in _TOKEN_KEYS):
+        return {k: u.get(k) for k in _TOKEN_KEYS}
+    raw_map = _usage_raw_map(platform)
+    return {k: u.get(raw_map[k]) for k in _TOKEN_KEYS}
+
+
+def agent_duration_ms(record: dict) -> object:
+    """Read agent wall duration; accepts new and legacy JSONL field names."""
+    if "agent_duration_ms" in record:
+        return record["agent_duration_ms"]
+    return record.get("claude_duration_ms")
+
+
+def agent_api_ms(record: dict) -> object:
+    """Read agent API duration; accepts new and legacy JSONL field names."""
+    if "agent_api_ms" in record:
+        return record["agent_api_ms"]
+    return record.get("claude_api_ms")
 
 
 # Coarse run-outcome label derived from Odin's exit code (see cli.py).
@@ -148,6 +212,7 @@ class RunAccumulator:
         project: object,
         queue: object,
         branch: str | None,
+        platform: str | None = None,
         enabled: bool = True,
         path: Path | None = None,
     ) -> None:
@@ -155,6 +220,7 @@ class RunAccumulator:
         self.project = str(project)
         self.queue = str(queue)
         self.branch = branch
+        self.platform = platform
         self.enabled = enabled
         self.path = path
         self.host = socket.gethostname()
@@ -165,6 +231,7 @@ class RunAccumulator:
         self.failed = 0
         self.held = 0
         self.cost_total = 0.0
+        self._any_cost = False  # True once any task yields a numeric cost_usd
         self.tokens_total = {k: 0 for k in _TOKEN_KEYS}
         self._finished = False
 
@@ -176,10 +243,12 @@ class RunAccumulator:
         else:
             self.failed += 1
 
-        usage = _norm_usage(getattr(result, "usage", None))
+        platform = getattr(result, "platform", None) or self.platform
+        usage = _norm_usage(getattr(result, "usage", None), platform=platform)
         cost = getattr(result, "cost_usd", None)
         if isinstance(cost, (int, float)):
             self.cost_total += cost
+            self._any_cost = True
         for k in _TOKEN_KEYS:
             v = usage.get(k)
             if isinstance(v, (int, float)):
@@ -198,13 +267,14 @@ class RunAccumulator:
                 "project": self.project,
                 "queue": self.queue,
                 "branch": self.branch,
+                "platform": platform,
                 "task": task_stem,
                 "outcome": outcome,
                 "stop_reason": getattr(result, "stop_reason", None),
                 "error": getattr(result, "error", None),
                 "wall_ms": getattr(result, "wall_ms", None),
-                "claude_duration_ms": getattr(result, "duration_ms", None),
-                "claude_api_ms": getattr(result, "api_ms", None),
+                "agent_duration_ms": getattr(result, "duration_ms", None),
+                "agent_api_ms": getattr(result, "api_ms", None),
                 "num_turns": getattr(result, "num_turns", None),
                 "tokens": usage,
                 "cost_usd": cost,
@@ -235,13 +305,18 @@ class RunAccumulator:
                 "project": self.project,
                 "queue": self.queue,
                 "branch": self.branch,
+                "platform": self.platform,
                 "tasks_completed": self.completed,
                 "tasks_failed": self.failed,
                 "tasks_held": self.held,
                 "tasks_total": tasks_total,
                 "wall_ms": int((time.monotonic() - self._mono) * 1000),
                 "tokens_total": dict(self.tokens_total),
-                "cost_usd_total": round(self.cost_total, 6),
+                # null when no task reported a numeric cost (Cursor has none);
+                # 0.0 only when costs were seen and summed to zero.
+                "cost_usd_total": (
+                    round(self.cost_total, 6) if self._any_cost else None
+                ),
                 "exit_code": exit_code,
                 "stop": _stop_for(exit_code),
             },
@@ -333,6 +408,7 @@ def aggregate(
     outcomes = {"completed": 0, "held": 0, "failed": 0}
     tokens_total = _empty_tokens()
     cost_total = 0.0
+    any_cost = False
     for t in tasks:
         outcomes[t.get("outcome", "failed")] = outcomes.get(t.get("outcome", "failed"), 0) + 1
         tk = t.get("tokens") or {}
@@ -343,6 +419,7 @@ def aggregate(
         c = t.get("cost_usd")
         if isinstance(c, (int, float)):
             cost_total += c
+            any_cost = True
 
     # Per-project rollup.
     by_project: dict[str, dict] = {}
@@ -353,7 +430,8 @@ def aggregate(
             {
                 "project": proj,
                 "tasks": 0, "completed": 0, "held": 0, "failed": 0,
-                "runs": 0, "cost": 0.0, "tokens": _empty_tokens(),
+                "runs": 0, "cost": 0.0, "_any_cost": False,
+                "tokens": _empty_tokens(),
                 "_wall": [],
             },
         )
@@ -362,6 +440,7 @@ def aggregate(
         c = t.get("cost_usd")
         if isinstance(c, (int, float)):
             p["cost"] += c
+            p["_any_cost"] = True
         tk = t.get("tokens") or {}
         for k in _TOKEN_KEYS:
             v = tk.get(k)
@@ -375,11 +454,44 @@ def aggregate(
     projects = []
     for proj, p in by_project.items():
         st = _stats(p.pop("_wall"))
+        any_p = p.pop("_any_cost")
         p["runs"] = run_count_by_project.get(proj, 0)
+        p["cost"] = p["cost"] if any_p else None
         p["task_mean_ms"] = st["mean"]
         p["task_median_ms"] = st["median"]
         projects.append(p)
     projects.sort(key=lambda p: p["tasks"], reverse=True)
+
+    # Per-platform rollup (only surfaced by renderers when mixed).
+    by_platform: dict[str, dict] = {}
+    for t in tasks:
+        plat = str(t.get("platform") or "?")
+        pl = by_platform.setdefault(
+            plat,
+            {
+                "platform": plat,
+                "tasks": 0, "completed": 0, "held": 0, "failed": 0,
+                "cost": 0.0, "_any_cost": False,
+                "tokens": _empty_tokens(),
+            },
+        )
+        pl["tasks"] += 1
+        pl[t.get("outcome", "failed")] = pl.get(t.get("outcome", "failed"), 0) + 1
+        c = t.get("cost_usd")
+        if isinstance(c, (int, float)):
+            pl["cost"] += c
+            pl["_any_cost"] = True
+        tk = t.get("tokens") or {}
+        for k in _TOKEN_KEYS:
+            v = tk.get(k)
+            if isinstance(v, (int, float)):
+                pl["tokens"][k] += v
+    platforms = []
+    for plat, pl in by_platform.items():
+        any_pl = pl.pop("_any_cost")
+        pl["cost"] = pl["cost"] if any_pl else None
+        platforms.append(pl)
+    platforms.sort(key=lambda p: p["tasks"], reverse=True)
 
     peak, peak_at = _peak_concurrency(runs)
 
@@ -389,6 +501,7 @@ def aggregate(
             "ts_end": r.get("ts_end"),
             "project": r.get("project"),
             "branch": r.get("branch"),
+            "platform": r.get("platform"),
             "tasks_total": r.get("tasks_total"),
             "completed": r.get("tasks_completed"),
             "failed": r.get("tasks_failed"),
@@ -406,13 +519,14 @@ def aggregate(
         "n_runs": len(runs),
         "n_tasks": len(tasks),
         "outcomes": outcomes,
-        "cost_total": cost_total,
+        "cost_total": cost_total if any_cost else None,
         "tokens_total": tokens_total,
         "task_wall": _stats([t.get("wall_ms") for t in tasks]),
         "run_wall": _stats([r.get("wall_ms") for r in runs]),
         "peak_concurrency": peak,
         "peak_at": peak_at,
         "projects": projects,
+        "platforms": platforms,
         "recent_runs": recent_runs,
     }
 
@@ -435,7 +549,15 @@ def _fmt_ms(ms: object) -> str:
 
 
 def _fmt_cost(c: object) -> str:
-    return f"${c:,.2f}" if isinstance(c, (int, float)) else "$0.00"
+    if c is None:
+        return "-"
+    return f"${c:,.2f}" if isinstance(c, (int, float)) else "-"
+
+
+def _sum_costs(costs: list) -> float | None:
+    """Sum numeric costs; ``None`` when no numeric cost was present."""
+    nums = [c for c in costs if isinstance(c, (int, float))]
+    return sum(nums) if nums else None
 
 
 def _fmt_int(n: object) -> str:
@@ -513,9 +635,28 @@ def render_text(agg: dict) -> str:
             f"{sum(p['runs'] for p in ps):>4}  {sum(p['tasks'] for p in ps):>5}  "
             f"{sum(p['completed'] for p in ps):>4}  {sum(p['held'] for p in ps):>4}  "
             f"{sum(p['failed'] for p in ps):>4}  "
-            f"{_fmt_cost(sum((p['cost'] or 0) for p in ps)):>9}  "
+            f"{_fmt_cost(_sum_costs([p['cost'] for p in ps])):>9}  "
             f"{_fmt_ms(agg['task_wall']['mean']):>9}"
         )
+
+    # Platform breakdown only when more than one platform appears in the data.
+    platforms = agg.get("platforms") or []
+    if len(platforms) > 1:
+        lines += ["", "By platform"]
+        name_w = max(len(str(p["platform"])) for p in platforms)
+        name_w = min(max(name_w, 8), 20)
+        header = (
+            f"  {'platform'.ljust(name_w)}  {'tasks':>5}  "
+            f"{'done':>4}  {'held':>4}  {'fail':>4}  {'cost':>9}"
+        )
+        lines.append(header)
+        for p in platforms:
+            lines.append(
+                f"  {str(p['platform']).ljust(name_w)[:name_w]}  "
+                f"{p['tasks']:>5}  {p['completed']:>4}  "
+                f"{p['held']:>4}  {p['failed']:>4}  "
+                f"{_fmt_cost(p['cost']):>9}"
+            )
 
     if agg["recent_runs"]:
         lines += ["", "Recent runs"]
@@ -647,11 +788,33 @@ def render_html(agg: dict) -> str:
             f"<td class=ok>{sum(p['completed'] for p in ps)}</td>"
             f"<td class=warn>{sum(p['held'] for p in ps)}</td>"
             f"<td class=bad>{sum(p['failed'] for p in ps)}</td>"
-            f"<td>{e(_fmt_cost(sum((p['cost'] or 0) for p in ps)))}</td>"
+            f"<td>{e(_fmt_cost(_sum_costs([p['cost'] for p in ps])))}</td>"
             f"<td>{e(_fmt_int(t_tok))}</td>"
             f"<td>{e(_fmt_ms(agg['task_wall']['mean']))}</td>"
             "</tr></tfoot></table>"
         )
+
+    platforms = agg.get("platforms") or []
+    if len(platforms) > 1:
+        parts.append("<h2>By platform</h2><table><thead><tr>"
+                     "<th>platform</th><th>tasks</th>"
+                     "<th>done</th><th>held</th><th>fail</th>"
+                     "<th>cost</th><th>tokens</th>"
+                     "</tr></thead><tbody>")
+        for p in platforms:
+            ptok = sum(v for v in p["tokens"].values() if isinstance(v, (int, float)))
+            parts.append(
+                "<tr>"
+                f"<td>{e(str(p['platform']))}</td>"
+                f"<td>{p['tasks']}</td>"
+                f"<td class=ok>{p['completed']}</td>"
+                f"<td class=warn>{p['held']}</td>"
+                f"<td class=bad>{p['failed']}</td>"
+                f"<td>{e(_fmt_cost(p['cost']))}</td>"
+                f"<td>{e(_fmt_int(ptok))}</td>"
+                "</tr>"
+            )
+        parts.append("</tbody></table>")
 
     if agg["recent_runs"]:
         parts.append("<h2>Recent runs</h2><table><thead><tr>"

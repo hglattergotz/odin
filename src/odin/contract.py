@@ -1,29 +1,39 @@
-"""The protocol Odin injects into every task via `--append-system-prompt`.
+"""The protocol Odin injects into every task via `--append-system-prompt`
+(Claude) or by prepending to the stdin prompt (Cursor).
 
 This is the ONE place Odin contributes rules to the agent, and it is limited to
 the *protocol* — how to terminate a task and how to phrase questions — never
 workflow (testing, commit policy, branching strategy), which stays in the
-target project's CLAUDE.md.
+target project's instruction file (`CLAUDE.md` / `AGENTS.md`).
 
-Injecting the contract (rather than relying on the target CLAUDE.md to carry
-the snippet) makes Odin self-contained: tasks emit parseable output even if a
-project forgot to paste the snippet.
+Injecting the contract (rather than relying on the target instruction file to
+carry the snippet) makes Odin self-contained: tasks emit parseable output even
+if a project forgot to paste the snippet.
 """
 
 from __future__ import annotations
 
+#: Per-platform name of the file the agent is told to defer to for workflow.
+#: Unknown platforms fall back to the generic phrase below.
+_INSTRUCTIONS_BY_PLATFORM: dict[str, str] = {
+    "claude": "CLAUDE.md",
+    "cursor": "AGENTS.md",
+}
+_GENERIC_INSTRUCTIONS = "project instructions"
+
+
 _BASE = """\
 You are being run by Odin, a headless task orchestrator, in addition to this \
-project's CLAUDE.md. Follow this output protocol exactly.
+project's {instructions}. Follow this output protocol exactly.
 
 ## Precedence
 
-If anything in this project's CLAUDE.md conflicts with this protocol, THIS \
+If anything in this project's {instructions} conflicts with this protocol, THIS \
 protocol wins for exactly two things: (1) how you end a task (the sentinel \
 blocks below) and (2) git/branch/PR policy (see Branch, when present). Defer to \
-the project's CLAUDE.md for everything else — how and when to test, code style, \
-project conventions. Do not manage the task queue or hunt for "the next task": \
-Odin sequences tasks and gives you the context you need.
+the project's {instructions} for everything else — how and when to test, code \
+style, project conventions. Do not manage the task queue or hunt for "the next \
+task": Odin sequences tasks and gives you the context you need.
 
 ## Terminating a task
 
@@ -53,20 +63,20 @@ layout) are yours — just proceed.
 When you emit `<<<NEEDS_INPUT>>>`, the body MUST be a single JSON object so \
 Odin can render it for the user. Be brief — do not overwhelm. Schema:
 
-{
+{{
   "questions": [
-    {
+    {{
       "problem": "one-line statement of what is blocking you",
       "question": "the specific decision needed?",
       "options": [
-        {"key": "a", "label": "short label", "detail": "one-line trade-off"},
-        {"key": "b", "label": "short label", "detail": "one-line trade-off"}
+        {{"key": "a", "label": "short label", "detail": "one-line trade-off"}},
+        {{"key": "b", "label": "short label", "detail": "one-line trade-off"}}
       ],
       "recommended": "a",
       "why": "one short sentence on why you recommend it"
-    }
+    }}
   ]
-}
+}}
 
 Rules for questions:
 - Keep every field to a single line; favour 2-3 options.
@@ -83,8 +93,8 @@ whose body is a JSON list:
 
 <<<FOLLOW_UP>>>
 [
-  {"title": "short imperative title", "urgent": false, "body": "a self-contained task prompt: what to do and why"},
-  {"title": "...", "urgent": true, "body": "..."}
+  {{"title": "short imperative title", "urgent": false, "body": "a self-contained task prompt: what to do and why"}},
+  {{"title": "...", "urgent": true, "body": "..."}}
 ]
 <<<END>>>
 
@@ -104,17 +114,35 @@ _BRANCH = """\
 You are working on the git branch `{branch}`. When the task is complete, commit \
 your work to this branch. Do NOT create or switch branches, do NOT push, and do \
 NOT open pull requests — the entire queue runs on this single branch. This \
-overrides any contrary git instructions in the project's CLAUDE.md.
+overrides any contrary git instructions in the project's {instructions}.
 """
 
 
-def build_system_prompt(branch: str | None) -> str:
-    """Return the `--append-system-prompt` text for a run.
+def _instructions_name(platform: str | None) -> str:
+    """Return the instruction-file label to inject for `platform`."""
+    if platform is None:
+        return _INSTRUCTIONS_BY_PLATFORM["claude"]
+    key = platform.strip().lower()
+    return _INSTRUCTIONS_BY_PLATFORM.get(key, _GENERIC_INSTRUCTIONS)
+
+
+def build_system_prompt(
+    branch: str | None,
+    *,
+    platform: str | None = None,
+) -> str:
+    """Return the protocol text injected into every task.
 
     When `branch` is set, append the single-branch / no-PR directive so the
     whole queue lands on one branch. When None (e.g. `--no-git` or a non-git
     project), only the sentinel + question protocol is injected.
+
+    `platform` selects the instruction-file name the agent is told to defer to
+    for workflow (`CLAUDE.md` for Claude, `AGENTS.md` for Cursor). Defaults to
+    Claude's name so `odin guide` and callers that omit it keep the prior text.
     """
+    instructions = _instructions_name(platform)
+    text = _BASE.format(instructions=instructions)
     if branch:
-        return _BASE + _BRANCH.format(branch=branch)
-    return _BASE
+        return text + _BRANCH.format(branch=branch, instructions=instructions)
+    return text

@@ -1,8 +1,8 @@
-"""Runner tests using a fake `claude` shell script.
+"""Runner tests using fake `claude` / `agent` shell scripts.
 
-The fake script ignores all args and emits a fixed stream-json sequence
-chosen by the FAKE_CLAUDE_SCENARIO env var. This keeps the tests fast
-and decoupled from the real Claude binary.
+Each fake script ignores all args and emits a fixed stream-json sequence
+chosen by an env var (FAKE_CLAUDE_SCENARIO / FAKE_AGENT_SCENARIO). This
+keeps the tests fast and decoupled from the real CLI binaries.
 """
 
 from __future__ import annotations
@@ -14,9 +14,15 @@ from pathlib import Path
 
 import pytest
 
+from odin.backends import ClaudeBackend, CursorBackend, GrokBackend, RunOptions
 from odin.runner import (
-    _abbrev_path, _handle_event, _render_agent_text, _tool_detail, run_claude,
+    _abbrev_path, _render_agent_text, _tool_detail, run_agent,
 )
+
+
+def _handle_event(event, out, project_dir=None):
+    """Shim: the per-event renderer moved into ClaudeBackend (Batch A3)."""
+    return ClaudeBackend().handle_stream_event(event, out, project_dir)
 
 
 FAKE_SCRIPT = r"""#!/bin/sh
@@ -89,15 +95,22 @@ def project_dir(tmp_path: Path) -> Path:
     return p
 
 
+def _run_agent(project: Path, fake: Path, *, out=None, **opts):
+    """Invoke the generic loop with the Claude backend and a fake `claude`."""
+    return run_agent(
+        "do the thing",
+        project,
+        ClaudeBackend(),
+        system_prompt=opts.pop("system_prompt", None),
+        run_options=RunOptions(binary=str(fake), **opts),
+        out=out if out is not None else io.StringIO(),
+    )
+
+
 def _run(scenario: str, fake: Path, project: Path):
     os.environ["FAKE_CLAUDE_SCENARIO"] = scenario
     try:
-        return run_claude(
-            "do the thing",
-            project,
-            claude_bin=str(fake),
-            out=io.StringIO(),
-        )
+        return _run_agent(project, fake)
     finally:
         os.environ.pop("FAKE_CLAUDE_SCENARIO", None)
 
@@ -146,12 +159,7 @@ def test_terminal_text_is_streamed_to_out(fake_claude: Path, project_dir: Path):
     os.environ["FAKE_CLAUDE_SCENARIO"] = "completed"
     sink = io.StringIO()
     try:
-        run_claude(
-            "do the thing",
-            project_dir,
-            claude_bin=str(fake_claude),
-            out=sink,
-        )
+        _run_agent(project_dir, fake_claude, out=sink)
     finally:
         os.environ.pop("FAKE_CLAUDE_SCENARIO", None)
     output = sink.getvalue()
@@ -167,13 +175,7 @@ def test_system_prompt_passed_as_append_flag(fake_claude: Path, project_dir: Pat
     os.environ["FAKE_CLAUDE_SCENARIO"] = "echo_args"
     os.environ["ODIN_ARGS_FILE"] = str(args_file)
     try:
-        run_claude(
-            "do the thing",
-            project_dir,
-            claude_bin=str(fake_claude),
-            system_prompt="CONTRACT-TEXT",
-            out=io.StringIO(),
-        )
+        _run_agent(project_dir, fake_claude, system_prompt="CONTRACT-TEXT")
     finally:
         os.environ.pop("FAKE_CLAUDE_SCENARIO", None)
         os.environ.pop("ODIN_ARGS_FILE", None)
@@ -187,10 +189,7 @@ def test_disallowed_tools_and_default_permission_mode_passed(fake_claude: Path, 
     os.environ["FAKE_CLAUDE_SCENARIO"] = "echo_args"
     os.environ["ODIN_ARGS_FILE"] = str(args_file)
     try:
-        run_claude(
-            "x", project_dir, claude_bin=str(fake_claude),
-            disallowed_tools=["Bash(rm:*)", "WebFetch"], out=io.StringIO(),
-        )
+        _run_agent(project_dir, fake_claude, disallowed_tools=["Bash(rm:*)", "WebFetch"])
     finally:
         os.environ.pop("FAKE_CLAUDE_SCENARIO", None)
         os.environ.pop("ODIN_ARGS_FILE", None)
@@ -207,7 +206,7 @@ def test_no_system_prompt_flag_when_absent(fake_claude: Path, project_dir: Path,
     os.environ["FAKE_CLAUDE_SCENARIO"] = "echo_args"
     os.environ["ODIN_ARGS_FILE"] = str(args_file)
     try:
-        run_claude("x", project_dir, claude_bin=str(fake_claude), out=io.StringIO())
+        _run_agent(project_dir, fake_claude)
     finally:
         os.environ.pop("FAKE_CLAUDE_SCENARIO", None)
         os.environ.pop("ODIN_ARGS_FILE", None)
@@ -247,9 +246,9 @@ def test_max_turns_flag_omitted_by_default_and_added_when_set(fake_claude: Path,
     os.environ["FAKE_CLAUDE_SCENARIO"] = "echo_args"
     os.environ["ODIN_ARGS_FILE"] = str(args_file)
     try:
-        run_claude("x", project_dir, claude_bin=str(fake_claude), out=io.StringIO())
+        _run_agent(project_dir, fake_claude)
         assert "--max-turns" not in args_file.read_text().splitlines()
-        run_claude("x", project_dir, claude_bin=str(fake_claude), max_turns=200, out=io.StringIO())
+        _run_agent(project_dir, fake_claude, max_turns=200)
         argv = args_file.read_text().splitlines()
         assert "--max-turns" in argv and "200" in argv
     finally:
@@ -374,9 +373,250 @@ def test_render_agent_text_keeps_code_fences_and_bolds_on_tty():
 
 def test_missing_project_dir_raises(fake_claude: Path, tmp_path: Path):
     with pytest.raises(FileNotFoundError):
-        run_claude(
-            "x",
-            tmp_path / "nope",
-            claude_bin=str(fake_claude),
+        _run_agent(tmp_path / "nope", fake_claude)
+
+
+# ----------------------------------------------------------------------
+# fake `agent` — Cursor-shaped NDJSON scenarios (Batch B5)
+# ----------------------------------------------------------------------
+#
+# Same pattern as the fake claude above: a shell script that ignores its args,
+# picks a fixed Cursor-shaped stream from FAKE_AGENT_SCENARIO, and exits. The
+# shapes mirror the proposal's empirical captures: no stop_reason / cost /
+# num_turns on the result, camelCase usage, tool_call started/completed pairs,
+# and the invalid-model failure mode (exit 1, stderr only, NO result event).
+
+FAKE_AGENT_SCRIPT = r"""#!/bin/sh
+cat >/dev/null
+case "$FAKE_AGENT_SCENARIO" in
+  completed)
+    printf '%s\n' '{"type":"system","subtype":"init","session_id":"cursor-sess-1","model":"Composer","cwd":"/proj"}'
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"working on it"}]}}'
+    printf '%s\n' '{"type":"thinking","text":"quiet please"}'
+    printf '%s\n' '{"type":"tool_call","subtype":"started","call_id":"c1","tool_call":{"shellToolCall":{"args":{"command":"echo hi"}}}}'
+    printf '%s\n' '{"type":"tool_call","subtype":"completed","call_id":"c1","tool_call":{"shellToolCall":{"args":{"command":"echo hi"},"result":{"exitCode":0}}}}'
+    printf '%s\n' '{"type":"result","subtype":"success","duration_ms":42,"duration_api_ms":40,"is_error":false,"result":"All done.\n<<<NEXT_CONTEXT>>>\nDo task 2.\n<<<END>>>","session_id":"cursor-sess-1","usage":{"inputTokens":100,"outputTokens":5,"cacheReadTokens":7,"cacheWriteTokens":1}}'
+    exit 0
+    ;;
+  held)
+    printf '%s\n' '{"type":"system","subtype":"init","session_id":"cursor-sess-2"}'
+    printf '%s\n' '{"type":"result","subtype":"success","duration_ms":9,"duration_api_ms":8,"is_error":false,"result":"<<<NEEDS_INPUT>>>\nWhich db?\n<<<END>>>","session_id":"cursor-sess-2","usage":{"inputTokens":1,"outputTokens":1,"cacheReadTokens":0,"cacheWriteTokens":0}}'
+    exit 0
+    ;;
+  invalid_model)
+    # Appendix C.4: a bad --model dies before any stream — stderr + exit 1,
+    # no result event at all. Silence must classify as failure.
+    echo "Cannot use this model: nope" >&2
+    exit 1
+    ;;
+  is_error)
+    printf '%s\n' '{"type":"result","subtype":"error","duration_ms":3,"duration_api_ms":2,"is_error":true,"result":"something broke","session_id":"cursor-sess-3"}'
+    exit 0
+    ;;
+  echo_args)
+    printf '%s\n' "$@" > "$ODIN_ARGS_FILE"
+    printf '%s\n' '{"type":"result","subtype":"success","duration_ms":1,"duration_api_ms":1,"is_error":false,"result":"<<<NEXT_CONTEXT>>>\nok\n<<<END>>>","session_id":"cursor-sess-4"}'
+    exit 0
+    ;;
+  *)
+    echo "unknown scenario: $FAKE_AGENT_SCENARIO" >&2
+    exit 99
+    ;;
+esac
+"""
+
+
+@pytest.fixture
+def fake_agent(tmp_path: Path, monkeypatch) -> Path:
+    # CursorBackend.build_invoke reads the user config; keep the suite blind to
+    # a developer's real ODIN_CONFIG (ODIN_HOME is already isolated in conftest).
+    monkeypatch.delenv("ODIN_CONFIG", raising=False)
+    script = tmp_path / "fake-agent.sh"
+    script.write_text(FAKE_AGENT_SCRIPT)
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+def _run_cursor(project: Path, fake: Path, *, out=None, **opts):
+    """Invoke the generic loop with the Cursor backend and a fake `agent`."""
+    return run_agent(
+        "do the thing",
+        project,
+        CursorBackend(),
+        system_prompt=opts.pop("system_prompt", None),
+        run_options=RunOptions(binary=str(fake), **opts),
+        out=out if out is not None else io.StringIO(),
+    )
+
+
+def _run_agent_scenario(scenario: str, fake: Path, project: Path, *, out=None, **opts):
+    os.environ["FAKE_AGENT_SCENARIO"] = scenario
+    try:
+        return _run_cursor(project, fake, out=out, **opts)
+    finally:
+        os.environ.pop("FAKE_AGENT_SCENARIO", None)
+
+
+def test_agent_completed_scenario(fake_agent: Path, project_dir: Path):
+    r = _run_agent_scenario("completed", fake_agent, project_dir)
+    assert r.succeeded is True
+    assert r.exit_code == 0
+    assert r.platform == "cursor"
+    assert r.stop_reason is None              # never faked for Cursor
+    assert r.session_id == "cursor-sess-1"
+    assert "<<<NEXT_CONTEXT>>>" in r.final_text
+    assert r.error is None
+    assert r.usage == {"input": 100, "output": 5, "cache_read": 7, "cache_creation": 1}
+    assert r.cost_usd is None and r.num_turns is None
+    assert r.duration_ms == 42 and r.api_ms == 40
+
+
+def test_agent_stream_renders_text_and_tool_line_once(fake_agent: Path, project_dir: Path):
+    sink = io.StringIO()
+    _run_agent_scenario("completed", fake_agent, project_dir, out=sink)
+    output = sink.getvalue()
+    assert "[session cursor-s…]" in output
+    assert "working on it" in output
+    assert output.count("→ Shell  echo hi") == 1   # started renders, completed is quiet
+    assert "quiet please" not in output            # thinking stays off the terminal
+
+
+def test_agent_held_scenario(fake_agent: Path, project_dir: Path):
+    r = _run_agent_scenario("held", fake_agent, project_dir)
+    # Clean termination — the orchestrator parses NEEDS_INPUT out of final_text.
+    assert r.succeeded is True
+    assert "<<<NEEDS_INPUT>>>" in r.final_text
+
+
+def test_agent_invalid_model_no_result_event(fake_agent: Path, project_dir: Path):
+    r = _run_agent_scenario("invalid_model", fake_agent, project_dir)
+    assert r.succeeded is False
+    assert r.exit_code == 1
+    assert r.final_text == ""
+    assert "Cannot use this model" in r.error
+
+
+def test_agent_is_error_result_fails(fake_agent: Path, project_dir: Path):
+    r = _run_agent_scenario("is_error", fake_agent, project_dir)
+    assert r.succeeded is False
+    assert r.exit_code == 0                   # gate keys off is_error, not exit
+    assert r.error == "error"
+
+
+def test_agent_argv_autonomy_and_optional_flags(
+    fake_agent: Path, project_dir: Path, tmp_path: Path
+):
+    args_file = tmp_path / "agent-argv.txt"
+    os.environ["ODIN_ARGS_FILE"] = str(args_file)
+    try:
+        _run_agent_scenario(
+            "echo_args", fake_agent, project_dir,
+            model="composer-2.5", sandbox="disabled", approve_mcps=True,
+        )
+    finally:
+        os.environ.pop("ODIN_ARGS_FILE", None)
+    argv = args_file.read_text().splitlines()
+    assert "--force" in argv and "--trust" in argv
+    assert argv[argv.index("--workspace") + 1] == str(project_dir)
+    assert argv[argv.index("--model") + 1] == "composer-2.5"
+    assert argv[argv.index("--sandbox") + 1] == "disabled"
+    assert "--approve-mcps" in argv
+    # No claude-only flags leak into a cursor invocation.
+    for flag in ("--append-system-prompt", "--permission-mode", "--verbose"):
+        assert flag not in argv
+
+
+# ----------------------------------------------------------------------
+# GrokBackend via fake grok (file prompt + text deltas + terminal end)
+# ----------------------------------------------------------------------
+
+FAKE_GROK_SCRIPT = r"""#!/bin/sh
+# Record argv; assert --prompt-file exists and contains the task prompt.
+printf '%s\n' "$@" > "$ODIN_ARGS_FILE"
+prompt_file=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--prompt-file" ]; then prompt_file="$a"; fi
+  prev="$a"
+done
+if [ -z "$prompt_file" ] || [ ! -f "$prompt_file" ]; then
+  echo "missing --prompt-file" >&2
+  exit 2
+fi
+case "$FAKE_GROK_SCENARIO" in
+  completed)
+    printf '%s\n' '{"type":"text","data":"All done.\\n<<<NEXT_CONTEXT>>>\\n"}'
+    printf '%s\n' '{"type":"text","data":"Do task 2.\\n<<<END>>>"}'
+    printf '%s\n' '{"type":"end","stopReason":"EndTurn","sessionId":"grok-1","usage":{"input_tokens":3,"output_tokens":4},"total_cost_usd":0.01,"num_turns":2}'
+    exit 0
+    ;;
+  error_event)
+    printf '%s\n' '{"type":"text","data":"partial"}'
+    printf '%s\n' '{"type":"error","message":"boom"}'
+    exit 0
+    ;;
+  *)
+    echo "unknown scenario: $FAKE_GROK_SCENARIO" >&2
+    exit 99
+    ;;
+esac
+"""
+
+
+@pytest.fixture
+def fake_grok(tmp_path: Path) -> Path:
+    script = tmp_path / "fake-grok.sh"
+    script.write_text(FAKE_GROK_SCRIPT)
+    script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+def test_grok_completed_accumulates_text_deltas(
+    fake_grok: Path, project_dir: Path, tmp_path: Path
+):
+    args_file = tmp_path / "grok-argv.txt"
+    os.environ["ODIN_ARGS_FILE"] = str(args_file)
+    os.environ["FAKE_GROK_SCENARIO"] = "completed"
+    try:
+        r = run_agent(
+            "do the thing",
+            project_dir,
+            GrokBackend(),
+            system_prompt="CONTRACT",
+            run_options=RunOptions(binary=str(fake_grok)),
             out=io.StringIO(),
         )
+    finally:
+        os.environ.pop("FAKE_GROK_SCENARIO", None)
+        os.environ.pop("ODIN_ARGS_FILE", None)
+    assert r.succeeded is True
+    assert r.platform == "grok"
+    assert "<<<NEXT_CONTEXT>>>" in r.final_text
+    assert "Do task 2." in r.final_text
+    assert r.session_id == "grok-1"
+    assert r.cost_usd == 0.01
+    argv = args_file.read_text().splitlines()
+    assert "--prompt-file" in argv
+    assert "--rules" in argv and "CONTRACT" in argv
+    assert "--output-format" in argv and "streaming-json" in argv
+    # Temp prompt file must be cleaned up by the loop.
+    pf = argv[argv.index("--prompt-file") + 1]
+    assert not Path(pf).exists()
+
+
+def test_grok_error_event_fails(fake_grok: Path, project_dir: Path, tmp_path: Path):
+    os.environ["ODIN_ARGS_FILE"] = str(tmp_path / "grok-argv.txt")
+    os.environ["FAKE_GROK_SCENARIO"] = "error_event"
+    try:
+        r = run_agent(
+            "do the thing",
+            project_dir,
+            GrokBackend(),
+            run_options=RunOptions(binary=str(fake_grok)),
+            out=io.StringIO(),
+        )
+    finally:
+        os.environ.pop("FAKE_GROK_SCENARIO", None)
+        os.environ.pop("ODIN_ARGS_FILE", None)
+    assert r.succeeded is False
+    assert r.error == "boom"

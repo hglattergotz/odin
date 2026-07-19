@@ -5,7 +5,8 @@ from __future__ import annotations
 import io
 
 from odin.prompts import (
-    BranchPlan, ask_branch_choice, ask_continue, ask_questions, render_questions,
+    BranchPlan, ask_branch_choice, ask_continue, ask_questions,
+    ask_run_confirmation, render_questions,
 )
 from odin.protocol import Option, Question
 
@@ -144,3 +145,78 @@ def test_ask_continue_reprompts_on_garbage():
     out = io.StringIO()
     assert ask_continue(in_=io.StringIO("huh\ns\n"), out=out) is False
     assert "Please type c or s" in out.getvalue()
+
+
+# ----- ask_run_confirmation ------------------------------------------
+
+def _confirm_kwargs(**overrides):
+    from pathlib import Path
+    base = dict(
+        platform="cursor",
+        model="composer-2.5-fast",
+        binary="agent",
+        queue_name="multi-platform",
+        pending_count=3,
+        project=Path("/path/to/project"),
+    )
+    base.update(overrides)
+    return base
+
+
+class _TTYIn(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def test_ask_run_confirmation_tty_enter_and_yes_proceed():
+    out = io.StringIO()
+    assert ask_run_confirmation(**_confirm_kwargs(), in_=_TTYIn("\n"), out=out) is True
+    assert "platform:  cursor" in out.getvalue()
+    assert "model:     composer-2.5-fast" in out.getvalue()
+    assert ask_run_confirmation(**_confirm_kwargs(), in_=_TTYIn("y\n"), out=io.StringIO()) is True
+    assert ask_run_confirmation(**_confirm_kwargs(), in_=_TTYIn("yes\n"), out=io.StringIO()) is True
+
+
+def test_ask_run_confirmation_tty_no_aborts():
+    out = io.StringIO()
+    assert ask_run_confirmation(**_confirm_kwargs(), in_=_TTYIn("n\n"), out=out) is False
+    assert "Proceed?" in out.getvalue()
+    assert ask_run_confirmation(**_confirm_kwargs(), in_=_TTYIn("no\n"), out=io.StringIO()) is False
+
+
+def test_ask_run_confirmation_tty_eof_aborts():
+    assert ask_run_confirmation(**_confirm_kwargs(), in_=_TTYIn(""), out=io.StringIO()) is False
+
+
+def test_ask_run_confirmation_non_tty_info_line_proceeds():
+    out = io.StringIO()
+    # Plain StringIO is not a TTY — one info line, no prompt wait.
+    assert ask_run_confirmation(
+        **_confirm_kwargs(), in_=io.StringIO("n\n"), out=out,
+    ) is True
+    rendered = out.getvalue()
+    assert "odin: platform=cursor model=composer-2.5-fast" in rendered
+    assert "Proceed?" not in rendered
+
+
+def test_ask_run_confirmation_unset_model_shows_platform_default():
+    out = io.StringIO()
+    ask_run_confirmation(
+        **_confirm_kwargs(model=None), in_=_TTYIn("y\n"), out=out,
+    )
+    assert "model:     (platform default)" in out.getvalue()
+    # Non-TTY form too.
+    info = io.StringIO()
+    ask_run_confirmation(
+        **_confirm_kwargs(model=None, platform="claude"),
+        in_=io.StringIO(""), out=info,
+    )
+    assert "odin: platform=claude model=(platform default)" in info.getvalue()
+
+
+def test_ask_run_confirmation_reprompts_on_garbage():
+    out = io.StringIO()
+    assert ask_run_confirmation(
+        **_confirm_kwargs(), in_=_TTYIn("huh\nn\n"), out=out,
+    ) is False
+    assert "Please type y or n" in out.getvalue()

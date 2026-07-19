@@ -1,19 +1,39 @@
-# Odin — Headless Claude Code Task Orchestrator
+# Odin — Headless Multi-Platform Task Orchestrator
 
 ## Purpose
 
-Odin is a minimal CLI that runs a queue of tasks through Claude Code in
-headless mode (`claude -p`). It feeds tasks one at a time into a target
-project's Claude Code session, parses the structured output, carries
-context forward between tasks, and halts cleanly when the agent needs
-human input.
+Odin is a minimal CLI that runs a queue of tasks through a headless agent
+CLI: **Claude Code** (`claude`), **Cursor CLI** (`agent`), or **Grok Build**
+(`grok`). You select the product with `--platform` (or `$ODIN_PLATFORM` /
+`default_platform` in config). There is no built-in default. Tasks run one
+at a time. Odin parses the structured output, carries context forward
+between tasks, and halts cleanly when the agent needs human input.
 
 Orchestration is intentionally dumb. Odin does not dictate workflow
 (clean-tree checks, branching, commits, tests). All of that lives in the
-**target project's** `CLAUDE.md`. Odin's job is to invoke, observe, route,
-and carry context. A well-formed target project's `CLAUDE.md` is the
-reference; `examples/target-claude-md-snippet.md` shows the sentinel contract.
+**target project's** instruction file (`CLAUDE.md` for Claude Code, `AGENTS.md`
+/ `.cursor/rules` for Cursor CLI). Odin's job is to invoke, observe, route, and
+carry context. Snippets: `examples/target-claude-md-snippet.md` and
+`examples/target-agents-md-snippet.md`.
 
+## Multi-platform architecture
+
+The task loop (queue, carry-context, held/resume, follow-ups, git startup,
+terminal signaling, metrics shape) is platform-agnostic. Platform-specific
+pieces live behind an `AgentBackend` in `src/odin/backends/`. Prefer **public
+product names** in docs; the short `--platform` key matches the binary:
+
+| Public product | `--platform` | Binary | Class |
+|----------------|--------------|--------|-------|
+| Claude Code | `claude` | `claude` | `ClaudeBackend` |
+| Cursor CLI | `cursor` | `agent` | `CursorBackend` |
+| Grok Build | `grok` | `grok` | `GrokBackend` |
+
+See `docs/agent-backends.md` for invoke details. Design notes:
+`docs/multi-platform-agents-proposal.md`.
+
+`--platform` / `$ODIN_PLATFORM` / `default_platform` in config selects the
+backend; if all are unset, `odin run` errors. Unknown names are a hard error.
 ## Language and layout
 
 Python 3.11+, **uv-managed**. Zero runtime dependencies (stdlib only).
@@ -29,7 +49,9 @@ odin/
 │   ├── __init__.py
 │   ├── cli.py           # argparse + entry point
 │   ├── queue.py         # filesystem queue model
-│   ├── runner.py        # `claude -p` invocation + JSON parsing
+│   ├── runner.py        # generic agent subprocess loop + NDJSON parsing
+│   ├── backends/        # AgentBackend peers: claude, cursor, grok + registry
+│   ├── config.py        # ~/.odin/config.toml load/save + resolution
 │   ├── protocol.py      # sentinel markers + JSON question parsing
 │   ├── contract.py      # the protocol Odin injects via system prompt
 │   ├── git.py           # startup-only git wrapper (clean check + branch)
@@ -37,28 +59,36 @@ odin/
 │   ├── demo.py          # `odin demo` scaffolder (test fixture)
 │   ├── _demo_files.py   # generated: embedded otest fixture content
 │   ├── guide.py         # `odin guide` authoring manual (self-discovery)
-│   ├── lint.py          # startup CLAUDE.md git-conflict warnings (advisory)
+│   ├── lint.py          # startup instruction-file git-conflict warnings
 │   ├── metrics.py       # central JSONL run/task metrics + report renderers
 │   ├── term.py          # best-effort OSC terminal signaling (title/color/notify)
-│   └── completed.py     # COMPLETED.md mailbox (Odin->Claude handoff)
+│   └── completed.py     # COMPLETED.md mailbox (Odin→agent handoff)
 ├── examples/
 │   ├── queue/
 │   │   ├── pending/
 │   │   └── done/
-│   └── target-claude-md-snippet.md   # the bit a target project must add
+│   ├── target-claude-md-snippet.md   # Claude target workflow snippet
+│   └── target-agents-md-snippet.md   # Cursor target workflow snippet
 └── tests/
 ```
 
 ## CLI surface
 
 ```
-odin run    [QUEUE_DIR] [--project PATH] [--max-tasks N] [--allowed-tools LIST] [--disallowed-tools LIST] [--permission-mode MODE] [--branch NAME] [--base NAME] [--no-git] [--no-metrics] [--no-title] [--notify] [--tab-title PREFIX] [--tab-color HEX] [--no-color] [--completed-file] [--dry-run]
+odin run    [QUEUE_DIR] [--project PATH] [--platform NAME] [--model MODEL]
+            [--agent-bin PATH] [--claude-bin PATH] [--max-tasks N]
+            [--allowed-tools LIST] [--disallowed-tools LIST] [--permission-mode MODE]
+            [--force] [--trust] [--sandbox MODE] [--approve-mcps]
+            [--branch NAME] [--base NAME] [--no-git] [--no-metrics] [--no-title]
+            [--notify] [--tab-title PREFIX] [--tab-color HEX] [--no-color]
+            [--completed-file] [--dry-run]
 odin status [QUEUE_DIR]
 odin resume HELD_TASK [QUEUE_DIR]
 odin demo   DIR [--force]
 odin guide  [TOPIC]
 odin archive [QUEUE_DIR]
 odin metrics [--html [PATH]] [--project SUBSTR] [--file PATH]
+odin config [show|get KEY|set KEY VALUE]
 ```
 
 `odin archive` operates on a **container** of named sub-queues: it moves every
@@ -74,21 +104,22 @@ backlog→promote, failed→retry). Logic in `queue.archive_finished_subqueues` 
 `archive_state` / `last_activity` / `archived_subqueues`.
 
 `odin guide` prints a self-contained authoring manual to stdout (queue layout,
-task-file format, CLAUDE.md workflow, the injected protocol, the run flow) so
-an agent in another project can self-discover the format with no other context.
-`TOPIC` ∈ {all (default), tasks, claude-md, protocol, terminal}. The `terminal`
-topic is an agent-executable iTerm2 setup manual (install, per-project tab-color
-shell hook, `--notify` alerts, verify) — point an agent at it to configure a
-terminal for Odin's tab signaling. The protocol section is generated from
-`contract.build_system_prompt`, so it can't drift from runtime.
-Content lives in `guide.py`.
+task-file format, CLAUDE.md / AGENTS.md workflow, the injected protocol, the
+run flow) so an agent in another project can self-discover the format with no
+other context. `TOPIC` ∈ {all (default), tasks, claude-md, agent-md, protocol,
+terminal}. The `agent-md` topic covers Cursor instruction files and the
+cross-platform layout; `terminal` is an agent-executable iTerm2 setup manual.
+The protocol section is generated from `contract.build_system_prompt`, so it
+can't drift from runtime. Content lives in `guide.py`.
 
 `odin demo` scaffolds the `otest` throwaway target project (a `greeter` CLI
 build with a 7-task queue, including a held→resume cycle on task 005) into
-`DIR` — a repeatable end-to-end test fixture. `--force` wipes and recreates an
-existing demo dir (refuses if it looks like a real repo). The fixture content
-is embedded in `_demo_files.py` (generated from a pristine `../otest`); the
-scaffolding logic is in `demo.py`.
+`DIR` — a repeatable end-to-end test fixture. **Demo stays Claude-only for
+v1** (CLAUDE.md + `claude` on PATH); Cursor is exercised manually via
+`odin run --platform cursor` (documented in the demo readme). `--force` wipes
+and recreates an existing demo dir (refuses if it looks like a real repo).
+The fixture content is embedded in `_demo_files.py`; scaffolding logic is in
+`demo.py`.
 
 `odin metrics` reads the central metrics log and prints an aggregate summary
 (run/task counts, outcomes, token usage, cost, average run/task times, peak
@@ -97,6 +128,11 @@ self-contained HTML report instead of text (default `odin-metrics.html`);
 `--project SUBSTR` filters by project path substring; `--file` overrides the
 log path. Content/logic lives in `metrics.py`.
 
+`odin config` views or edits `$ODIN_HOME/config.toml` (default
+`~/.odin/config.toml`; `$ODIN_CONFIG` overrides). Interactive menu on a TTY;
+`show` / `get KEY` / `set KEY VALUE` for non-interactive use. This is the
+**only** command that writes the config — `odin run` never auto-scaffolds it.
+
 Defaults:
 - `QUEUE_DIR` = `./queue`. A bare name (no path separator that already exists)
   resolves under `./queue/`: `odin run add-search` → `queue/add-search` when it
@@ -104,6 +140,17 @@ Defaults:
   wins; nonexistent falls through unchanged. Shared by run/status/resume/archive
   via `cli._resolve_queue_arg`.
 - `--project` = current working directory
+- `--platform` = unset → `$ODIN_PLATFORM` → `default_platform` in config →
+  error if still unset (no built-in product default). Registered peers:
+  `claude`, `cursor`, `grok` (see `docs/agent-backends.md`). Unknown names
+  are a hard registry error. `--model` = unset → `$ODIN_MODEL` →
+  `platforms.<platform>.model` → platform CLI default (no `--model` flag
+  emitted).
+- `--agent-bin` = unset → config `platforms.<p>.binary` → backend default
+  (works for every platform). `--claude-bin` is a deprecated alias that only
+  applies when platform is `claude`. Cursor autonomy flags
+  (`--force`/`--trust`/`--sandbox`/`--approve-mcps`) are ignored on non-cursor
+  platforms with a warning.
 - `--permission-mode` = `bypassPermissions` — full autonomy by default (the
   agent runs all tools, incl. Bash, ungated). A headless agent that must stop
   for per-command approval can't work and thrashes. The safety net is the
@@ -116,6 +163,22 @@ Defaults:
   for non-git projects.
 - `--no-metrics` = don't record metrics for this run (metrics are on by
   default; `ODIN_NO_METRICS=1` disables them globally).
+- `--dry-run` = preview one task's resolved platform + argv (from
+  `backend.build_invoke`) and prompt, without spawning the agent.
+
+## Write surfaces outside the queue/target project
+
+Odin writes **two** things outside the queue and target project:
+
+1. **Metrics telemetry** — append-only JSONL under `$ODIN_HOME/metrics/`
+   (see Metrics below). Written automatically on every `odin run` unless
+   disabled.
+2. **User-initiated config** — `$ODIN_HOME/config.toml`, written **only**
+   via explicit `odin config` (interactive or `set`). Never silent
+   auto-scaffolding during `odin run`.
+
+Everything else Odin touches stays inside the queue dir or is a best-effort
+TTY escape / opt-in `COMPLETED.md` mailbox in the queue.
 
 ## Metrics
 
@@ -123,7 +186,8 @@ Every `odin run` appends two record types — `task` (one per execution) and
 `run` (one summary per invocation), linked by a `run_id` — to a single central
 JSONL log shared across all projects: `$ODIN_HOME/metrics/events.jsonl`
 (default `~/.odin/metrics/events.jsonl`; `$ODIN_METRICS_FILE` overrides the
-file). This is the *one* thing Odin writes outside the queue/target project.
+file). Together with user-initiated `odin config` writes, this is one of the
+two things Odin writes outside the queue/target project.
 
 Rules (see `metrics.py`):
 - **JSONL, append-only.** One record per line so a torn trailing line (crash
@@ -225,13 +289,14 @@ Every task must terminate with exactly one of two fenced blocks:
   JSON object (`{"questions": [...]}`) Odin renders for the user. Nothing
   is committed when this is emitted.
 
-Odin **injects this protocol itself** via `claude --append-system-prompt`
-(see `contract.py`), so tasks emit parseable output even if a target
-project forgot the snippet. This is the *one* exception to "Odin
-contributes no rules": it injects the **protocol only** (sentinel +
-question schema + the single-branch directive), never workflow. The
-question JSON schema (problem → question → options → optional
-recommendation + why, all brief) lives in `contract.py`.
+Odin **injects this protocol itself** via the active backend (Claude:
+`--append-system-prompt`; Cursor: prepended to the stdin prompt — see
+`contract.py`), so tasks emit parseable output even if a target project
+forgot the snippet. This is the *one* exception to "Odin contributes no
+rules": it injects the **protocol only** (sentinel + question schema + the
+single-branch directive), never workflow. The question JSON schema (problem →
+question → options → optional recommendation + why, all brief) lives in
+`contract.py`.
 
 Odin scans the final assistant `result` for these markers. Anything else
 routes to `failed/` for human inspection — silence is treated as failure
@@ -281,22 +346,23 @@ because fresh-context-per-task is the whole point.
 ## What lives where
 
 - **This `CLAUDE.md`** — rules for working on Odin itself.
-- **Target project `CLAUDE.md`** — workflow rules + sentinel emission.
-  See `examples/target-claude-md-snippet.md` for a focused snippet
-  showing just the sentinel contract.
+- **Target project instructions** — workflow rules (Claude: `CLAUDE.md`;
+  Cursor: `AGENTS.md` / `.cursor/rules`). Sentinel emission is injected by
+  Odin; see `examples/target-claude-md-snippet.md` and
+  `examples/target-agents-md-snippet.md`.
 - **Per-task `.md` files** — the body of the prompt. No frontmatter.
 
 ## Non-goals
 
 - No UI. CLI only.
 - No long-running server. One-shot `odin run`.
-- No retry beyond what the target CLAUDE.md describes. Failed tasks stay
+- No retry beyond what the target instructions describe. Failed tasks stay
   failed until the user moves them back to `pending/`.
 - No parallelism. Tasks are strictly sequential.
 - **Git is startup-only.** Odin verifies a clean tree and selects/creates
   the one branch the whole queue lands on, then checks it out — once,
   before the loop. It never commits, pushes, merges, or opens PRs;
-  per-task commits stay the target CLAUDE.md's job. (This narrows the
+  per-task commits stay the target instructions' job. (This narrows the
   original "no git operations" non-goal — approved deliberately. `--no-git`
   restores the zero-git behaviour for non-git projects.)
 
@@ -310,14 +376,17 @@ uv tool install --from /path/to/odin odin
 
 # from inside any project
 cd ~/code/myproject
-odin run                       # uses ./queue, --project=$PWD
+odin run --platform claude     # Claude Code (`claude`)
+odin run --platform cursor     # Cursor CLI (`agent`)
+odin run --platform grok       # Grok Build (`grok`)
 ```
 
-The `claude -p` subprocess runs with `cwd` set to `--project` (default
-`$PWD`), so it picks up the **target project's** `CLAUDE.md`, not this one.
-The only rules Odin contributes are the **protocol** (sentinel + question
-schema + single-branch directive), injected via `--append-system-prompt`;
-all workflow rules still come from the target `CLAUDE.md`.
+The agent subprocess runs with `cwd` set to `--project` (default `$PWD`), so
+it picks up the **target project's** instruction file, not this one. The only
+rules Odin contributes are the **protocol** (sentinel + question schema +
+single-branch directive), injected via `--append-system-prompt` (Claude) or
+prompt prepend (Cursor); all workflow rules still come from the target
+instructions.
 
 ## Supply chain rules
 
@@ -345,37 +414,40 @@ that needs explicit user approval.
 
 ## Implementation rules
 
-- Stdlib only at runtime. `claude` must be on `PATH`; Odin shells out.
-- `claude -p` invocation flags (baseline):
-  `--output-format stream-json --verbose --permission-mode bypassPermissions
-  --append-system-prompt <protocol>` plus any `--allowed-tools` /
-  `--disallowed-tools` the user passed. **No `--max-turns` by default** — an
-  arbitrary turn cap can kill a healthy in-progress session (it isn't imposed
-  on an interactive run either); only pass `--max-turns` when the user sets it
-  as a circuit-breaker. Never `--resume` — every task is a fresh session.
+- Stdlib only at runtime. The selected platform's binary must be on `PATH`
+  (or passed via `--claude-bin` / `--agent-bin`); Odin shells out.
+- Invocation is built by `backend.build_invoke` (never hard-code argv in the
+  loop). Claude baseline: `--output-format stream-json --verbose
+  --permission-mode bypassPermissions --append-system-prompt <protocol>`.
+  Cursor baseline: `--output-format stream-json --force --trust --workspace
+  <project>` with protocol prepended to stdin. **No `--max-turns` by
+  default** — only pass it when the user sets it as a circuit-breaker.
+  Never `--resume` — every task is a fresh session.
 - **Drain stderr concurrently.** The runner reads the subprocess's stderr on a
   background thread, not after `wait()`. Reading only stdout while the child
   fills its ~64KB stderr pipe deadlocks the session (the agent then perceives
   delayed tool output and spam-probes with `echo`). Don't regress this.
-- Set the subprocess `cwd` to `--project` so the target CLAUDE.md loads.
+- Set the subprocess `cwd` to `--project` so the target instructions load.
 - **Git startup** (unless `--no-git` or non-git project): refuse to start
   on a dirty tree (the queue dir is excluded from the check); resolve the
   branch from `--branch`/`--base`, else the interactive prompt on a TTY,
   else the current branch. Odin only ever runs `status`, `switch`,
   `show-ref`, `rev-parse`, `symbolic-ref` — never anything that writes
-  history. Per-task commits are the agent's job (per the target CLAUDE.md).
+  history. Per-task commits are the agent's job (per the target instructions).
 - **Conflict safeguards.** The injected contract states it takes precedence
-  over the target CLAUDE.md for task-termination and git/branch/PR policy.
-  When git is managed, `lint.scan_claude_md` warns (never blocks) if the
-  target CLAUDE.md mandates a conflicting workflow (PRs, branch-per-task,
-  push, no-commit). `odin guide claude-md` emits a pasteable "This project
-  is run by Odin" marker block for target projects.
+  over the target instructions for task-termination and git/branch/PR policy.
+  When git is managed, `lint.scan_project_instructions(project, platform)`
+  warns (never blocks) if the platform's instruction file mandates a
+  conflicting workflow (PRs, branch-per-task, push, no-commit).
+  `odin guide claude-md` / `odin guide agent-md` emit pasteable "This project
+  is run by Odin" marker blocks.
 - Stream stdout to the user's terminal live so they see progress; capture
   the final JSON for parsing. `--output-format stream-json` is the
   reliable way to get both.
-- Failure signals: non-zero exit, JSON `.error` set, or
-  `stop_reason != end_turn`. Any → `failed/`.
+- Failure signals are backend-owned (`RunResult.succeeded`): Claude uses
+  non-zero exit / `.error` / bad `stop_reason`; Cursor uses non-zero exit /
+  missing terminal `result` / `is_error`. Any → `failed/`.
 - Never delete a queue file. Only move between subdirs. The audit trail
   matters more than tidy directories.
 - Never assume the target project's git state — that's the target
-  CLAUDE.md's job. Odin reports what came back, nothing more.
+  instructions' job. Odin reports what came back, nothing more.

@@ -28,10 +28,13 @@ def test_full_guide_covers_every_essential():
 
 def test_protocol_section_is_sourced_from_contract():
     # The injected contract text must appear verbatim in the guide (indented),
-    # so the guide can never drift from runtime behaviour.
+    # so the guide can never drift from runtime behaviour. Guide shows the
+    # default (Claude) wording; Cursor runs get AGENTS.md via platform=.
     contract = build_system_prompt(None)
     first_real_line = next(ln for ln in contract.splitlines() if ln.strip())
     assert first_real_line in render()
+    assert "CLAUDE.md" in contract
+    assert "AGENTS.md" not in contract
 
 
 def test_topic_subsets():
@@ -44,8 +47,54 @@ def test_topic_subsets():
     assert "<<<NEEDS_INPUT>>>" in cm  # includes protocol
     assert "This project is run by Odin" in cm  # pasteable marker block
 
+    am = render("agent-md")
+    assert "AGENTS.md" in am
+    assert ".cursor/rules" in am
+    assert "--platform cursor" in am
+    assert "--platform grok" in am
+    assert "Grok Build" in am
+    assert "<<<NEXT_CONTEXT>>>" in am  # includes Cursor-worded protocol
+    assert "AGENTS.md" in am
+    assert "This project is run by Odin" in am
+    # Cursor topic shows AGENTS.md in the injected contract, not CLAUDE.md
+    assert "project's AGENTS.md" in am
+    assert "## 1. The queue" not in am
+    # Universal binary flag (not Claude-only)
+    assert "--agent-bin" in am
+    assert "deprecated" in am.lower() or "alias" in am.lower()
+
     proto = render("protocol")
     assert "<<<NEXT_CONTEXT>>>" in proto
+
+
+def test_full_guide_covers_agent_md():
+    text = render()
+    assert "AGENTS.md" in text
+    assert "target-agents-md-snippet.md" in text
+    assert "--platform cursor" in text
+    assert "--platform grok" in text
+    assert "Grok Build" in text
+    assert "Cursor CLI" in text
+    assert "Claude Code" in text
+
+
+def test_run_section_has_copy_paste_for_each_product():
+    run = render("tasks")  # includes run
+    assert "odin run <name> --platform claude" in run
+    assert "odin run <name> --platform cursor" in run
+    assert "odin run <name> --platform grok" in run
+    assert "--agent-bin" in run
+    assert "--yes" in run
+    assert "Claude Code (default)" not in run
+
+
+def test_cli_guide_agent_md(capsys):
+    rc = main(["guide", "agent-md"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "AGENTS.md" in out
+    assert ".cursor/rules" in out
+    assert "project's AGENTS.md" in out
 
 
 def test_terminal_topic_is_agent_executable():

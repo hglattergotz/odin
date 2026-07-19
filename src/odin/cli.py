@@ -16,19 +16,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
-from . import __version__, completed, git, metrics, style, term
+from . import __version__, completed, config, git, metrics, style, term
+from .backends.base import AgentBackend
+from .backends.registry import available_platforms, get_backend
 from .contract import build_system_prompt
 from .demo import DemoError, DemoExists, create_demo
 from .guide import TOPICS, render as render_guide
-from .lint import scan_claude_md
+from .lint import scan_project_instructions
 from .prompts import (
-    BranchPlan, ask_branch_choice, ask_continue, ask_questions, render_questions,
+    BranchPlan, ask_branch_choice, ask_config, ask_continue, ask_questions,
+    ask_run_confirmation, render_questions,
 )
 from .protocol import (
     FollowUp, Outcome, Question, parse, parse_follow_ups, parse_questions, unwrap_fence,
 )
 from .queue import Queue, Task, archive_finished_subqueues, archived_subqueues
-from .runner import RunResult, run_claude
+from .backends import RunOptions
+from .runner import RunResult, run_agent
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -105,7 +109,7 @@ def _build_parser() -> argparse.ArgumentParser:
         version=f"odin {__version__} (from {_pkg_dir})",
     )
     sub = p.add_subparsers(
-        dest="cmd", metavar="{run,status,resume,demo,guide,archive,metrics}"
+        dest="cmd", metavar="{run,status,resume,demo,guide,archive,metrics,config}"
     )
 
     run = sub.add_parser(
@@ -152,8 +156,52 @@ def _build_parser() -> argparse.ArgumentParser:
              "as a circuit-breaker against runaway sessions)",
     )
     run.add_argument(
-        "--claude-bin", default="claude",
-        help="path to the claude CLI (default: claude on PATH)",
+        "--claude-bin", default=None,
+        help="deprecated alias for --agent-bin (kept for backward compatibility). "
+             "Prefer --agent-bin for every platform, including claude.",
+    )
+    run.add_argument(
+        "--agent-bin", default=None,
+        help="path to the agent CLI for the active platform (resolution: this "
+             "flag → --claude-bin alias → platforms.<platform>.binary in config "
+             "→ the platform default). Works for claude, cursor, grok, …",
+    )
+    run.add_argument(
+        "--force", action="store_true",
+        help="(cursor) pass --force to the agent CLI. Already always on for "
+             "headless runs — a permission prompt would hang Odin — so this "
+             "flag only makes the posture explicit. Ignored on claude "
+             "(bypassPermissions covers it).",
+    )
+    run.add_argument(
+        "--trust", action="store_true",
+        help="(cursor) pass --trust to the agent CLI (trust the workspace). "
+             "Already always on for headless runs; explicit only. Ignored on "
+             "claude.",
+    )
+    run.add_argument(
+        "--sandbox", default=None, metavar="MODE",
+        help="(cursor) sandbox mode passed as --sandbox (enabled|disabled); "
+             "overrides platforms.cursor.sandbox in config. Ignored (with a "
+             "warning) on claude.",
+    )
+    run.add_argument(
+        "--approve-mcps", action="store_true", default=None,
+        help="(cursor) auto-approve MCP servers (--approve-mcps); overrides "
+             "platforms.cursor.approve_mcps in config. Ignored (with a "
+             "warning) on claude.",
+    )
+    run.add_argument(
+        "--platform", default=None,
+        help="required unless $ODIN_PLATFORM or default_platform in config is "
+             "set: claude (Claude Code), cursor (Cursor CLI), grok (Grok Build). "
+             "No built-in product default. See docs/agent-backends.md.",
+    )
+    run.add_argument(
+        "--model", default=None,
+        help="model passed to the agent CLI as --model (resolution: this flag → "
+             "$ODIN_MODEL → platforms.<platform>.model in config → unset). "
+             "Unset emits no --model, i.e. the platform CLI's own default.",
     )
     run.add_argument(
         "--branch", default=None,
@@ -205,7 +253,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--dry-run", action="store_true",
-        help="show what would run without invoking claude",
+        help="show what would run without invoking the agent",
+    )
+    run.add_argument(
+        "-y", "--yes", action="store_true",
+        help="skip the interactive platform/model confirmation on a TTY "
+             "(scripts that want defaults without hanging). Non-TTY runs "
+             "already skip the prompt.",
     )
     run.set_defaults(func=_cmd_run)
 
@@ -297,6 +351,28 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     mt.set_defaults(func=_cmd_metrics)
 
+    cf = sub.add_parser(
+        "config",
+        help="view or edit the user config (~/.odin/config.toml)",
+        description=(
+            "View or edit Odin's user config (default ~/.odin/config.toml, "
+            "$ODIN_CONFIG overrides). With no action, opens an interactive "
+            "menu on a TTY to set the default platform and per-platform model. "
+            "`show` prints the effective config; `get KEY` / `set KEY VALUE` "
+            "read or write a dotted key (e.g. platforms.claude.model). This is "
+            "the ONLY command that writes the config — `odin run` never does."
+        ),
+    )
+    cf.add_argument(
+        "action", nargs="?", choices=["show", "get", "set"], default=None,
+        help="show | get KEY | set KEY VALUE (omit for the interactive menu)",
+    )
+    cf.add_argument(
+        "params", nargs="*", metavar="ARG",
+        help="KEY for get; KEY VALUE for set",
+    )
+    cf.set_defaults(func=_cmd_config)
+
     return p
 
 
@@ -310,12 +386,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if not project.is_dir():
         print(f"odin: --project does not exist: {project}", file=sys.stderr)
         return 2
-    if not (project / "CLAUDE.md").exists():
-        print(
-            f"odin: warning — {project}/CLAUDE.md not found. "
-            "The agent will not know the sentinel protocol; tasks will likely fail.",
-            file=sys.stderr,
-        )
 
     # Visible-output styling: gate ANSI off when --no-color (or ODIN_NO_COLOR).
     # The NO_COLOR / ODIN_NO_COLOR env vars are honored by style.enabled() too;
@@ -341,16 +411,53 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if args.disallowed_tools else None
     )
 
+    # Resolve the agent platform + model (CLI flag → env → config; no product
+    # default) and pick the backend. Resolved before the dry-run branch so a
+    # missing/unknown `--platform` fails loudly even on a dry run.
+    try:
+        platform = config.resolve_platform(args.platform)
+    except config.PlatformRequiredError as e:
+        print(f"odin: {e}", file=sys.stderr)
+        return 2
+    model = config.resolve_model(args.model, platform=platform)
+    try:
+        backend = get_backend(platform)
+    except ValueError as e:
+        print(f"odin: {e}", file=sys.stderr)
+        return 2
+    _warn_ignored_platform_flags(args, platform)
+    # Missing-instruction warning must run *after* backend resolution so an
+    # AGENTS.md-only Cursor project is not falsely flagged for CLAUDE.md.
+    _warn_missing_instructions(project, backend)
+
+    # Pre-run platform/model confirmation. Skipped on --dry-run (argv preview
+    # is enough) and --yes (scripts). Non-TTY gets a one-line info print and
+    # continues; abort here exits 0 with no tasks / metrics / COMPLETED.md.
+    if not args.dry_run and not args.yes:
+        binary = _resolve_agent_binary(args, platform) or backend.default_binary()
+        if not ask_run_confirmation(
+            platform=platform,
+            model=model,
+            binary=binary,
+            queue_name=q.root.name,
+            pending_count=len(q.pending()),
+            project=project,
+        ):
+            print("odin: aborted.")
+            return 0
+
     # Startup git setup: clean-tree check + select/create the one branch the
     # whole queue lands on. Skipped on --dry-run and for non-git projects.
     if args.dry_run:
         branch = args.branch
     else:
-        branch, err = _setup_branch(args, project, q.root)
+        branch, err = _setup_branch(args, project, q.root, platform=platform)
         if err is not None:
             return err
     # Always inject the protocol; add the branch directive when we have one.
-    system_prompt = build_system_prompt(branch)
+    # Pass platform so the injected text names the right instruction file
+    # (CLAUDE.md vs AGENTS.md) instead of hard-coding Claude's.
+    system_prompt = build_system_prompt(branch, platform=platform)
 
     # Central metrics: one accumulator per run, fed one record per task, with the
     # run summary written in a finally so it lands on every exit path. Off for
@@ -361,6 +468,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         project=project,
         queue=q.root,
         branch=branch,
+        platform=platform,
         enabled=metrics_on,
     )
     signals = _resolve_signals(args)
@@ -376,7 +484,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     try:
         exit_code = _run_loop(
             args, project, q, allowed, disallowed, system_prompt, acc, signals,
-            branch=branch,
+            backend, model=model, branch=branch,
         )
     finally:
         acc.finish(exit_code)
@@ -391,6 +499,57 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if not args.dry_run:
             _reset_terminal(signals, q, sys.stdout)
     return exit_code
+
+
+def _resolve_agent_binary(
+    args: argparse.Namespace, platform: str | None = None,
+) -> str | None:
+    """Resolve the agent CLI binary for any platform (peers, not Claude-special).
+
+    Order: ``--agent-bin`` → ``--claude-bin`` (deprecated; only when platform is
+    ``claude``) → None (backend / config default). ``--claude-bin`` on a
+    non-claude platform is ignored with a soft warning — use ``--agent-bin``.
+    """
+    agent = (args.agent_bin or "").strip() or None
+    claude_alias = (getattr(args, "claude_bin", None) or "").strip() or None
+    if agent:
+        if claude_alias and agent != claude_alias:
+            print(
+                "odin: warning — both --agent-bin and --claude-bin set; "
+                "using --agent-bin.",
+                file=sys.stderr,
+            )
+        return agent
+    if claude_alias:
+        if (platform or "claude") == "claude":
+            return claude_alias
+        print(
+            "odin: warning — --claude-bin is a deprecated alias for Claude; "
+            f"ignored for platform '{platform}'. Use --agent-bin.",
+            file=sys.stderr,
+        )
+    return None
+
+
+def _warn_ignored_platform_flags(args: argparse.Namespace, platform: str) -> None:
+    """Soft-warn when a per-platform flag doesn't apply to the active platform
+    (proposal §3: warn, never a hard error — the run proceeds without it)."""
+    ignored: list[str] = []
+    if platform != "cursor":
+        if args.force:
+            ignored.append("--force")
+        if args.trust:
+            ignored.append("--trust")
+        if args.sandbox:
+            ignored.append("--sandbox")
+        if args.approve_mcps is not None:
+            ignored.append("--approve-mcps")
+    if ignored:
+        print(
+            f"odin: warning — {', '.join(ignored)} not used by platform "
+            f"'{platform}'; ignoring.",
+            file=sys.stderr,
+        )
 
 
 # ----------------------------------------------------------------------
@@ -592,12 +751,28 @@ def _run_loop(
     system_prompt: str,
     acc: metrics.RunAccumulator,
     signals: Signals,
+    backend=None,
+    model: str | None = None,
     branch: str | None = None,
     out: TextIO = sys.stdout,
 ) -> int:
     """The task-processing loop. Records each task into `acc` and returns the
     process exit code; the caller writes the run summary."""
     completed = 0
+    # One binary override for every platform (--agent-bin; --claude-bin is a
+    # deprecated alias). None falls through to config / backend.default_binary().
+    binary = _resolve_agent_binary(args, getattr(backend, "name", None))
+    # One frozen options bundle per run — every field is loop-invariant.
+    run_options = RunOptions(
+        binary=binary,
+        model=model,
+        permission_mode=args.permission_mode,
+        allowed_tools=allowed or [],
+        disallowed_tools=disallowed or [],
+        max_turns=args.max_turns,
+        sandbox=args.sandbox,
+        approve_mcps=args.approve_mcps,
+    )
     # Planned total, computed once: tasks left + tasks already done this run.
     sig = _Signaler(signals, out, q.root.name, total=completed + len(q.pending()))
     while True:
@@ -618,24 +793,31 @@ def _run_loop(
         _banner_start(completed, sig.total, task.stem, project, branch)
 
         if args.dry_run:
-            print(f"[dry-run] would invoke: claude -p (cwd={project}, "
-                  f"perm={args.permission_mode}, allowed={allowed}, "
-                  f"disallowed={disallowed})")
-            print(f"[dry-run] prompt ({len(prompt)} chars):")
-            print(_indent(prompt[:2000]))
+            # Preview the real invocation, sourced from the backend (never a
+            # hard-coded `claude -p` — proposal C5), without spawning anything.
+            spec = backend.build_invoke(prompt, project, system_prompt, run_options)
+            argv_preview = list(spec.argv)
+            if (spec.prompt_via or "stdin").strip().lower() == "file":
+                argv_preview += [
+                    spec.prompt_file_flag or "--prompt-file",
+                    "<temp-prompt-file>",
+                ]
+            print(f"[dry-run] platform: {backend.name}")
+            print(f"[dry-run] prompt_via: {spec.prompt_via or 'stdin'}")
+            print(f"[dry-run] would invoke: {_preview_argv(argv_preview)} "
+                  f"(cwd={spec.cwd})")
+            print(f"[dry-run] prompt ({len(spec.prompt)} chars):")
+            print(_indent(_preview_prompt(spec.prompt)))
             return 0
 
         sig.task_start(completed)
         running = q.claim_running(task)
-        result = run_claude(
+        result = run_agent(
             prompt,
             project,
-            claude_bin=args.claude_bin,
-            permission_mode=args.permission_mode,
-            allowed_tools=allowed,
-            disallowed_tools=disallowed,
-            max_turns=args.max_turns,
+            backend,
             system_prompt=system_prompt,
+            run_options=run_options,
         )
         outcome, questions, follow_ups = _route(q, running, result)
         acc.record_task(task_stem=running.stem, outcome=outcome, result=result)
@@ -708,7 +890,11 @@ def _route(
 # ----------------------------------------------------------------------
 
 def _setup_branch(
-    args: argparse.Namespace, project: Path, queue_root: Path
+    args: argparse.Namespace,
+    project: Path,
+    queue_root: Path,
+    *,
+    platform: str,
 ) -> tuple[str | None, int | None]:
     """Resolve the branch the queue will run on.
 
@@ -740,25 +926,40 @@ def _setup_branch(
     except git.GitError as e:
         print(f"odin: {e}", file=sys.stderr)
         return None, 2
-    _warn_claude_md_conflicts(project)
+    _warn_instruction_conflicts(project, platform)
     return branch, None
 
 
-def _warn_claude_md_conflicts(project: Path) -> None:
-    """Soft-warn when the target CLAUDE.md mandates a git workflow that fights
-    Odin's one-branch/no-PR model. Advisory only — never blocks the run."""
-    claude_md = project / "CLAUDE.md"
-    if not claude_md.exists():
+def _warn_missing_instructions(project: Path, backend: AgentBackend) -> None:
+    """Soft-warn when none of the active platform's instruction files exist.
+
+    Claude → CLAUDE.md; Cursor → AGENTS.md or `.cursor/rules/`. Advisory only.
+    """
+    rels = backend.instruction_files()
+    if any((project / rel).exists() for rel in rels):
         return
-    reasons = scan_claude_md(claude_md.read_text(encoding="utf-8", errors="replace"))
-    if not reasons:
-        return
+    if len(rels) == 1:
+        missing = f"{project}/{rels[0]} not found"
+    else:
+        listed = " or ".join(str(r) for r in rels)
+        missing = f"none of {listed} found under {project}"
     print(
-        f"odin: note — {claude_md} {', '.join(reasons)}. Odin runs the whole "
-        "queue on one branch with no pull requests, and the injected protocol "
-        "overrides contrary git instructions. Review if that's unexpected.",
+        f"odin: warning — {missing}. "
+        "The agent will not know the sentinel protocol; tasks will likely fail.",
         file=sys.stderr,
     )
+
+
+def _warn_instruction_conflicts(project: Path, platform: str) -> None:
+    """Soft-warn when the platform's instruction files mandate a git workflow
+    that fights Odin's one-branch/no-PR model. Advisory only — never blocks."""
+    for path, reasons in scan_project_instructions(project, platform):
+        print(
+            f"odin: note — {path} {', '.join(reasons)}. Odin runs the whole "
+            "queue on one branch with no pull requests, and the injected protocol "
+            "overrides contrary git instructions. Review if that's unexpected.",
+            file=sys.stderr,
+        )
 
 
 def _resolve_branch(args: argparse.Namespace, project: Path) -> str:
@@ -1136,6 +1337,88 @@ def _cmd_guide(args: argparse.Namespace) -> int:
 
 
 # ----------------------------------------------------------------------
+# config
+# ----------------------------------------------------------------------
+
+def _cmd_config(args: argparse.Namespace) -> int:
+    action = args.action
+    params = list(args.params)
+    path = config.config_path()
+
+    if action == "show":
+        return _config_show(path)
+    if action == "get":
+        if len(params) != 1:
+            print("odin: usage: odin config get KEY", file=sys.stderr)
+            return 2
+        return _config_get(path, params[0])
+    if action == "set":
+        if len(params) != 2:
+            print("odin: usage: odin config set KEY VALUE", file=sys.stderr)
+            return 2
+        return _config_set(path, params[0], params[1])
+
+    # No action — interactive menu (TTY only).
+    if not sys.stdin.isatty():
+        print(
+            "odin: `odin config` is interactive; on a non-TTY use "
+            "`odin config set KEY VALUE` / `get` / `show`.",
+            file=sys.stderr,
+        )
+        return 2
+    cfg = config.load_config(path)
+    cfg = ask_config(
+        cfg,
+        platforms=available_platforms(),
+        suggestions=config.MODEL_SUGGESTIONS,
+    )
+    saved = config.save_config(cfg, path)
+    print(f"odin: wrote {saved}")
+    return 0
+
+
+def _config_show(path: Path) -> int:
+    cfg = config.load_config(path)
+    exists = path.exists()
+    print(f"# {path}{'' if exists else '  (does not exist yet)'}")
+    body = config.dump_toml(cfg)
+    print(body if body.strip() else "# (empty)")
+    # Effective resolution (factors in env vars), for orientation.
+    platform = config.try_resolve_platform(config=cfg)
+    if platform is None:
+        print("# effective platform: (unset — pass --platform or set default_platform)")
+        print("# effective model:    (n/a until platform is set)")
+    else:
+        model = config.resolve_model(platform=platform, config=cfg)
+        print(f"# effective platform: {platform}")
+        print(f"# effective model:    {model if model else '(platform default)'}")
+    return 0
+
+
+def _config_get(path: Path, key: str) -> int:
+    cfg = config.load_config(path)
+    value = config.get_in(cfg, key)
+    if value is None:
+        print(f"odin: key not set: {key}", file=sys.stderr)
+        return 1
+    if isinstance(value, dict):
+        print(config.dump_toml(value), end="")
+    elif isinstance(value, bool):
+        print("true" if value else "false")
+    else:
+        print(value)
+    return 0
+
+
+def _config_set(path: Path, key: str, raw_value: str) -> int:
+    cfg = config.load_config(path)
+    config.set_in(cfg, key, config.parse_value(raw_value))
+    saved = config.save_config(cfg, path)
+    print(f"odin: set {key} = {config.get_in(cfg, key)!r} -> {saved}")
+    return 0
+
+
+# ----------------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------------
 
@@ -1163,6 +1446,32 @@ def _is_container(q: Queue) -> bool:
     its own tasks — so commands can redirect instead of acting on an empty
     (or fabricated) queue."""
     return bool(q.subqueues()) and q.is_empty()
+
+
+def _preview_argv(argv: list[str], max_arg: int = 60) -> str:
+    """One-line display form of an argv for dry-run: multi-line args (the
+    injected contract riding on --append-system-prompt) collapse to one line
+    and long args truncate, so the preview stays readable. argv[0] (the
+    resolved binary path) is never truncated — it's what the user checks.
+    Display only — not guaranteed shell-pasteable."""
+    parts: list[str] = []
+    for i, a in enumerate(argv):
+        a = " ".join(a.split())
+        parts.append(a if i == 0 or len(a) <= max_arg else a[: max_arg - 1] + "…")
+    return " ".join(parts)
+
+
+def _preview_prompt(text: str, limit: int = 2000) -> str:
+    """Truncate a dry-run prompt preview, keeping head + tail when oversized.
+
+    Cursor prepends the protocol, so a head-only slice can hide the task body;
+    keeping the tail makes the actual task text visible in the preview.
+    """
+    if len(text) <= limit:
+        return text
+    head = limit * 3 // 4
+    tail = limit - head - 5
+    return text[:head] + "\n…\n" + text[-tail:]
 
 
 def _indent(text: str, prefix: str = "  | ") -> str:

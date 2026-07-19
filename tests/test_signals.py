@@ -71,7 +71,7 @@ def _drive(tmp_path, monkeypatch, *, tasks, results, signals, sink):
         (q.root / "pending" / name).write_text("body", encoding="utf-8")
 
     seq = list(results)
-    monkeypatch.setattr("odin.cli.run_claude", lambda *a, **k: seq.pop(0))
+    monkeypatch.setattr("odin.cli.run_agent", lambda *a, **k: seq.pop(0))
 
     args = _build_parser().parse_args(["run", str(qdir)])
     acc = metrics.RunAccumulator(
@@ -146,7 +146,7 @@ def test_max_tasks_limit_drains_with_title(tmp_path, monkeypatch):
     q = Queue(tmp_path / "queue" / "myq")
     for n in ("001-a.md", "002-b.md"):
         (q.root / "pending" / n).write_text("body")
-    monkeypatch.setattr("odin.cli.run_claude", lambda *a, **k: _completed())
+    monkeypatch.setattr("odin.cli.run_agent", lambda *a, **k: _completed())
     args = _build_parser().parse_args(["run", str(q.root), "--max-tasks", "1"])
     acc = metrics.RunAccumulator(run_id="t", project=project, queue=q.root,
                                  branch=None, enabled=False)
