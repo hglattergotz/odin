@@ -310,6 +310,72 @@ def test_run_missing_claude_md_warns_but_proceeds(setup, capsys):
     assert rc == 0
 
 
+def test_run_cursor_agents_md_only_no_spurious_claude_warning(
+    setup, tmp_path, monkeypatch, capsys
+):
+    """Acceptance: AGENTS.md-only project + --platform cursor → no CLAUDE.md warn."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    (project / "CLAUDE.md").unlink()
+    (project / "AGENTS.md").write_text("# cursor instructions\n")
+    rec = _cursor_recorder(
+        tmp_path / "fake-agent.sh", tmp_path / "argv.log", tmp_path / "stdin.log"
+    )
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--agent-bin", str(rec), "--no-git"],
+    )
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "CLAUDE.md" not in err
+    assert "not found" not in err
+    assert (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_cursor_missing_instructions_warns(setup, tmp_path, monkeypatch, capsys):
+    """Cursor with neither AGENTS.md nor .cursor/rules → missing-instruction warn."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    (project / "CLAUDE.md").unlink()
+    rec = _cursor_recorder(
+        tmp_path / "fake-agent.sh", tmp_path / "argv.log", tmp_path / "stdin.log"
+    )
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--agent-bin", str(rec), "--no-git"],
+    )
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "AGENTS.md" in err
+    assert ".cursor/rules" in err
+    assert "not found" in err or "none of" in err
+
+
+def test_run_cursor_rules_dir_alone_suppresses_missing_warn(
+    setup, tmp_path, monkeypatch, capsys
+):
+    """`.cursor/rules/` without AGENTS.md is enough for Cursor — no missing warn."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    (project / "CLAUDE.md").unlink()
+    (project / ".cursor" / "rules").mkdir(parents=True)
+    (project / ".cursor" / "rules" / "base.mdc").write_text("# rules\n")
+    rec = _cursor_recorder(
+        tmp_path / "fake-agent.sh", tmp_path / "argv.log", tmp_path / "stdin.log"
+    )
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--agent-bin", str(rec), "--no-git"],
+    )
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "not found" not in err
+    assert "none of" not in err
+
+
 def test_run_missing_project_dir_errors(setup):
     project, qdir, fake = setup
     _seed_task(qdir, "001-a.md")
@@ -695,6 +761,30 @@ def test_run_warns_on_conflicting_claude_md_but_proceeds(setup, capsys):
     assert rc == 0  # advisory only — never blocks
     err = capsys.readouterr().err
     assert "pull request" in err
+    assert (qdir / "done" / "001-a.md").exists()
+
+
+def test_run_warns_on_conflicting_agents_md_but_proceeds(
+    setup, tmp_path, monkeypatch, capsys
+):
+    """Cursor platform scans AGENTS.md (not CLAUDE.md) for git-workflow conflicts."""
+    _clean_platform_env(monkeypatch)
+    project, qdir, _ = setup
+    (project / "CLAUDE.md").unlink()
+    (project / "AGENTS.md").write_text("# proj\nAlways open a pull request per task.\n")
+    _init_repo(project)
+    rec = _cursor_recorder(
+        tmp_path / "fake-agent.sh", tmp_path / "argv.log", tmp_path / "stdin.log"
+    )
+    _seed_task(qdir, "001-a.md")
+    rc = _run_cli(
+        ["run", str(qdir), "--project", str(project),
+         "--platform", "cursor", "--agent-bin", str(rec), "--branch", "main"],
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "pull request" in err
+    assert "AGENTS.md" in err
     assert (qdir / "done" / "001-a.md").exists()
 
 

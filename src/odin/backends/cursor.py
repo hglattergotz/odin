@@ -112,7 +112,9 @@ class CursorBackend(AgentBackend):
         return "agent"
 
     def instruction_files(self) -> list[Path]:
-        return [Path("AGENTS.md")]
+        # Primary AGENTS.md plus optional scoped Cursor rules (proposal §7).
+        # Startup warns only when *neither* exists.
+        return [Path("AGENTS.md"), Path(".cursor/rules")]
 
     def build_invoke(
         self,

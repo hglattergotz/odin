@@ -206,7 +206,7 @@ def test_cursor_metadata():
     backend = CursorBackend()
     assert backend.name == "cursor"
     assert backend.default_binary() == "agent"
-    assert backend.instruction_files() == [Path("AGENTS.md")]
+    assert backend.instruction_files() == [Path("AGENTS.md"), Path(".cursor/rules")]
 
 
 def test_cursor_build_invoke_baseline_argv():

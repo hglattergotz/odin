@@ -17,11 +17,12 @@ from pathlib import Path
 from typing import TextIO
 
 from . import __version__, completed, config, git, metrics, style, term
+from .backends.base import AgentBackend
 from .backends.registry import available_platforms, get_backend
 from .contract import build_system_prompt
 from .demo import DemoError, DemoExists, create_demo
 from .guide import TOPICS, render as render_guide
-from .lint import scan_claude_md
+from .lint import scan_project_instructions
 from .prompts import (
     BranchPlan, ask_branch_choice, ask_config, ask_continue, ask_questions,
     render_questions,
@@ -380,12 +381,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if not project.is_dir():
         print(f"odin: --project does not exist: {project}", file=sys.stderr)
         return 2
-    if not (project / "CLAUDE.md").exists():
-        print(
-            f"odin: warning — {project}/CLAUDE.md not found. "
-            "The agent will not know the sentinel protocol; tasks will likely fail.",
-            file=sys.stderr,
-        )
 
     # Visible-output styling: gate ANSI off when --no-color (or ODIN_NO_COLOR).
     # The NO_COLOR / ODIN_NO_COLOR env vars are honored by style.enabled() too;
@@ -424,13 +419,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(f"odin: {e}", file=sys.stderr)
         return 2
     _warn_ignored_platform_flags(args, platform)
+    # Missing-instruction warning must run *after* backend resolution so an
+    # AGENTS.md-only Cursor project is not falsely flagged for CLAUDE.md.
+    _warn_missing_instructions(project, backend)
 
     # Startup git setup: clean-tree check + select/create the one branch the
     # whole queue lands on. Skipped on --dry-run and for non-git projects.
     if args.dry_run:
         branch = args.branch
     else:
-        branch, err = _setup_branch(args, project, q.root)
+        branch, err = _setup_branch(args, project, q.root, platform=platform)
         if err is not None:
             return err
     # Always inject the protocol; add the branch directive when we have one.
@@ -837,7 +835,11 @@ def _route(
 # ----------------------------------------------------------------------
 
 def _setup_branch(
-    args: argparse.Namespace, project: Path, queue_root: Path
+    args: argparse.Namespace,
+    project: Path,
+    queue_root: Path,
+    *,
+    platform: str,
 ) -> tuple[str | None, int | None]:
     """Resolve the branch the queue will run on.
 
@@ -869,25 +871,40 @@ def _setup_branch(
     except git.GitError as e:
         print(f"odin: {e}", file=sys.stderr)
         return None, 2
-    _warn_claude_md_conflicts(project)
+    _warn_instruction_conflicts(project, platform)
     return branch, None
 
 
-def _warn_claude_md_conflicts(project: Path) -> None:
-    """Soft-warn when the target CLAUDE.md mandates a git workflow that fights
-    Odin's one-branch/no-PR model. Advisory only — never blocks the run."""
-    claude_md = project / "CLAUDE.md"
-    if not claude_md.exists():
+def _warn_missing_instructions(project: Path, backend: AgentBackend) -> None:
+    """Soft-warn when none of the active platform's instruction files exist.
+
+    Claude → CLAUDE.md; Cursor → AGENTS.md or `.cursor/rules/`. Advisory only.
+    """
+    rels = backend.instruction_files()
+    if any((project / rel).exists() for rel in rels):
         return
-    reasons = scan_claude_md(claude_md.read_text(encoding="utf-8", errors="replace"))
-    if not reasons:
-        return
+    if len(rels) == 1:
+        missing = f"{project}/{rels[0]} not found"
+    else:
+        listed = " or ".join(str(r) for r in rels)
+        missing = f"none of {listed} found under {project}"
     print(
-        f"odin: note — {claude_md} {', '.join(reasons)}. Odin runs the whole "
-        "queue on one branch with no pull requests, and the injected protocol "
-        "overrides contrary git instructions. Review if that's unexpected.",
+        f"odin: warning — {missing}. "
+        "The agent will not know the sentinel protocol; tasks will likely fail.",
         file=sys.stderr,
     )
+
+
+def _warn_instruction_conflicts(project: Path, platform: str) -> None:
+    """Soft-warn when the platform's instruction files mandate a git workflow
+    that fights Odin's one-branch/no-PR model. Advisory only — never blocks."""
+    for path, reasons in scan_project_instructions(project, platform):
+        print(
+            f"odin: note — {path} {', '.join(reasons)}. Odin runs the whole "
+            "queue on one branch with no pull requests, and the injected protocol "
+            "overrides contrary git instructions. Review if that's unexpected.",
+            file=sys.stderr,
+        )
 
 
 def _resolve_branch(args: argparse.Namespace, project: Path) -> str:

@@ -366,7 +366,7 @@ that needs explicit user approval.
   history. Per-task commits are the agent's job (per the target CLAUDE.md).
 - **Conflict safeguards.** The injected contract states it takes precedence
   over the target CLAUDE.md for task-termination and git/branch/PR policy.
-  When git is managed, `lint.scan_claude_md` warns (never blocks) if the
+  When git is managed, `lint.scan_project_instructions` warns (never blocks) if the
   target CLAUDE.md mandates a conflicting workflow (PRs, branch-per-task,
   push, no-commit). `odin guide claude-md` emits a pasteable "This project
   is run by Odin" marker block for target projects.
