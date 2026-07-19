@@ -158,6 +158,14 @@ uv run pytest    # tests
 uv run odin -h   # run the live source without installing
 ```
 
+To install (or refresh) the global `odin` command from this checkout after a
+pull:
+
+```sh
+./scripts/install-tool.sh
+# or: ./scripts/install-tool.sh --editable
+```
+
 Stdlib only at runtime; dev tools are pinned and locked with a 14-day minimum
 package age (`tool.uv.exclude-newer`). See [CLAUDE.md](CLAUDE.md) for the full
 contributor and supply-chain rules.
