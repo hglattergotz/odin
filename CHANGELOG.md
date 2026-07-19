@@ -5,6 +5,31 @@ All notable changes to Odin are documented here. The format roughly follows
 [SemVer](https://semver.org/). Releases are git tags (`vX.Y.Z`); install one
 with `uv tool install --from 'git+https://github.com/hglattergotz/odin@vX.Y.Z' odin`.
 
+## [0.2.4] — 2026-07-19
+
+### Added
+- **Multi-platform agent backends:** run the same queue through **Claude Code**
+  (`claude`), **Cursor CLI** (`agent`), or **Grok Build** (`grok`) via peer
+  `AgentBackend` implementations. See `docs/agent-backends.md`.
+- `--platform` / `$ODIN_PLATFORM` / `default_platform` in config; `--model` /
+  `$ODIN_MODEL` / per-platform model in config; `odin config` to view and edit
+  `~/.odin/config.toml`.
+- Universal `--agent-bin` (any platform); `--claude-bin` remains a Claude-only
+  deprecated alias. Cursor-only flags: `--force`, `--trust`, `--sandbox`,
+  `--approve-mcps`.
+- TTY pre-run platform/model confirmation (`--yes` / `-y` to skip).
+- `scripts/install-tool.sh` to install or refresh the global `odin` uv-tool
+  from a local checkout (`--editable` optional).
+
+### Changed
+- **No built-in default platform.** `--platform` is required unless
+  `$ODIN_PLATFORM` or `default_platform` is set, so a model id cannot silently
+  pair with the wrong product.
+- Guide, README, and contract/lint/metrics are platform-aware (instruction
+  file names, product wording, null cost totals where a CLI omits cost).
+
+[0.2.4]: https://github.com/hglattergotz/odin/releases/tag/v0.2.4
+
 ## [0.2.2] — 2026-06-06
 
 ### Added

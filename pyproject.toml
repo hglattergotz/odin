@@ -1,7 +1,7 @@
 [project]
 name = "odin"
-version = "0.2.4.dev0"
-description = "Headless Claude Code task orchestrator"
+version = "0.2.4"
+description = "Headless multi-platform task orchestrator"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -10,7 +10,7 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = []
-keywords = ["claude", "claude-code", "llm", "agent", "orchestration", "cli", "automation"]
+keywords = ["claude", "claude-code", "cursor", "grok", "llm", "agent", "orchestration", "cli", "automation"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
