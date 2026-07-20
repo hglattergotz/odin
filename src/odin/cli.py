@@ -263,6 +263,59 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.set_defaults(func=_cmd_run)
 
+    ex = sub.add_parser(
+        "exec",
+        help="single-shot: run ONE prompt headless through a backend (no queue)",
+        description=(
+            "Run a single prompt through a headless agent backend and print its "
+            "final output to stdout — no queue, no git startup, no carry-context, "
+            "no interactive confirmation, and no injected sentinel protocol. "
+            "Reuses `odin run`'s platform/model/binary resolution and the shared "
+            "run loop, so a caller (e.g. a skill delegating an inner loop) can "
+            "dispatch work to a cheaper/local backend. Prompt comes from PROMPT, "
+            "--prompt-file, or stdin. Progress streams to stderr; the agent's "
+            "final text goes to stdout so the caller can capture it."
+        ),
+    )
+    ex.add_argument(
+        "prompt", nargs="?", default=None,
+        help="the prompt (or use --prompt-file, or pipe it on stdin)",
+    )
+    ex.add_argument("--prompt-file", default=None, help="read the prompt from a file")
+    ex.add_argument(
+        "--project", default=None, type=Path,
+        help="working directory for the agent (default: current directory)",
+    )
+    ex.add_argument(
+        "--platform", default=None,
+        help="required unless $ODIN_PLATFORM / default_platform in config is set: "
+             "claude, cursor, grok. No built-in product default.",
+    )
+    ex.add_argument(
+        "--model", default=None,
+        help="model passed to the agent CLI (this flag → $ODIN_MODEL → config → unset)",
+    )
+    ex.add_argument("--agent-bin", default=None, help="path to the agent CLI for the platform")
+    ex.add_argument("--claude-bin", default=None, help="deprecated alias for --agent-bin")
+    ex.add_argument(
+        "--permission-mode", default="bypassPermissions",
+        help="agent --permission-mode (default: bypassPermissions)",
+    )
+    ex.add_argument("--allowed-tools", default=None, help="comma-separated tool allowlist")
+    ex.add_argument("--disallowed-tools", default=None, help="comma-separated tool denylist")
+    ex.add_argument("--max-turns", type=int, default=None, help="cap the agent's turns")
+    ex.add_argument("--sandbox", default=None, metavar="MODE", help="(cursor) sandbox mode")
+    ex.add_argument(
+        "--approve-mcps", action="store_true", default=None, help="(cursor) auto-approve MCP servers",
+    )
+    ex.add_argument(
+        "--append-system-prompt", default=None,
+        help="text appended to the agent's system prompt (exec injects no protocol)",
+    )
+    ex.add_argument("--no-metrics", action="store_true", help="don't record a metrics event")
+    ex.add_argument("--no-color", action="store_true", help="disable ANSI color in progress output")
+    ex.set_defaults(func=_cmd_exec)
+
     st = sub.add_parser("status", help="show queue state")
     st.add_argument("queue", nargs="?", default="./queue", type=Path)
     st.add_argument(
@@ -499,6 +552,113 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if not args.dry_run:
             _reset_terminal(signals, q, sys.stdout)
     return exit_code
+
+
+def _cmd_exec(args: argparse.Namespace) -> int:
+    """Single-shot headless dispatch: run ONE prompt through a backend, no queue.
+
+    Reuses `odin run`'s platform/model/binary resolution and the shared
+    `run_agent` loop, but skips the queue, git startup, carry-context, the
+    interactive confirmation, and the injected sentinel protocol. For callers
+    that just need "run this prompt headless on backend X" — e.g. a skill
+    delegating an inner implement/verify loop to a cheaper backend. Progress
+    streams to stderr; the agent's final text goes to stdout so the caller can
+    capture it. Exit 0 iff the backend succeeded.
+    """
+    project = (args.project or Path.cwd()).resolve()
+    if not project.is_dir():
+        print(f"odin: --project does not exist: {project}", file=sys.stderr)
+        return 2
+
+    style.set_no_color(bool(args.no_color or os.environ.get("ODIN_NO_COLOR")))
+
+    # Prompt source: --prompt-file, then the positional arg, then stdin.
+    if args.prompt_file is not None:
+        try:
+            prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"odin: cannot read --prompt-file: {e}", file=sys.stderr)
+            return 2
+    elif args.prompt is not None:
+        prompt = args.prompt
+    elif not sys.stdin.isatty():
+        prompt = sys.stdin.read()
+    else:
+        print(
+            "odin: exec needs a prompt — pass PROMPT, --prompt-file, or pipe it on stdin",
+            file=sys.stderr,
+        )
+        return 2
+    if not prompt.strip():
+        print("odin: exec prompt is empty", file=sys.stderr)
+        return 2
+
+    # Same resolution as `odin run`: platform (required) -> model -> backend -> binary.
+    try:
+        platform = config.resolve_platform(args.platform)
+    except config.PlatformRequiredError as e:
+        print(f"odin: {e}", file=sys.stderr)
+        return 2
+    model = config.resolve_model(args.model, platform=platform)
+    try:
+        backend = get_backend(platform)
+    except ValueError as e:
+        print(f"odin: {e}", file=sys.stderr)
+        return 2
+    binary = _resolve_agent_binary(args, platform) or backend.default_binary()
+
+    allowed = (
+        [t.strip() for t in args.allowed_tools.split(",") if t.strip()]
+        if args.allowed_tools else None
+    )
+    disallowed = (
+        [t.strip() for t in args.disallowed_tools.split(",") if t.strip()]
+        if args.disallowed_tools else None
+    )
+    run_options = RunOptions(
+        binary=binary,
+        model=model,
+        permission_mode=args.permission_mode,
+        allowed_tools=allowed or [],
+        disallowed_tools=disallowed or [],
+        max_turns=args.max_turns,
+        sandbox=args.sandbox,
+        approve_mcps=args.approve_mcps,
+    )
+
+    # Live display to stderr so stdout stays a clean, capturable result.
+    result = run_agent(
+        prompt,
+        project,
+        backend,
+        system_prompt=(args.append_system_prompt or None),
+        run_options=run_options,
+        out=sys.stderr,
+    )
+
+    # One metrics record (no queue). Best-effort; off with --no-metrics / ODIN_NO_METRICS.
+    if metrics.enabled() and not args.no_metrics:
+        acc = metrics.RunAccumulator(
+            run_id=metrics.new_run_id(),
+            project=project,
+            queue="(exec)",
+            branch=None,
+            platform=platform,
+            enabled=True,
+        )
+        acc.record_task(
+            task_stem="exec",
+            outcome="completed" if result.succeeded else "failed",
+            result=result,
+        )
+        acc.finish(0 if result.succeeded else 1)
+
+    sys.stdout.write(result.final_text)
+    if not result.final_text.endswith("\n"):
+        sys.stdout.write("\n")
+    if result.error:
+        print(f"odin: exec error: {result.error}", file=sys.stderr)
+    return 0 if result.succeeded else 1
 
 
 def _resolve_agent_binary(
