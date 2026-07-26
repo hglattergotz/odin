@@ -876,6 +876,11 @@ def _run_loop(
 ) -> int:
     """The task-processing loop. Records each task into `acc` and returns the
     process exit code; the caller writes the run summary."""
+    # Resolve the sink before anything uses it. `_Signaler` writes OSC escapes
+    # straight to it, and a raw None would make every `out.isatty()` throw into
+    # term.py's best-effort swallow — silently killing the tab title and
+    # progress bar for the whole run, with no error anywhere.
+    out = _stdout(out)
     completed = 0
     # One binary override for every platform (--agent-bin; --claude-bin is a
     # deprecated alias). None falls through to config / backend.default_binary().

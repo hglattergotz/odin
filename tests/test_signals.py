@@ -232,6 +232,39 @@ def test_non_tty_sink_emits_nothing(tmp_path, monkeypatch):
 
 
 # ----------------------------------------------------------------------
+# the default sink — the path production actually takes
+# ----------------------------------------------------------------------
+# Every test above injects `out=`, which is precisely how 0.2.5 shipped with
+# the tab title and progress bar dead: `_run_loop`'s default went from
+# `sys.stdout` to `None`, `_cmd_run` never passes `out`, and a raw None makes
+# `out.isatty()` throw straight into term.py's best-effort swallow. No error,
+# no failing test, no chrome. Drive the default here instead.
+
+def test_default_sink_still_paints_the_tab(tmp_path, monkeypatch):
+    """`_run_loop` with no `out=` must emit to whatever sys.stdout is now."""
+    monkeypatch.delenv("TMUX", raising=False)
+    project = tmp_path / "proj"
+    project.mkdir(exist_ok=True)
+    q = Queue(tmp_path / "queue" / "myq")
+    (q.root / "pending" / "001-a.md").write_text("body", encoding="utf-8")
+    monkeypatch.setattr("odin.cli.run_agent", lambda *a, **k: _completed())
+
+    sink = _TTYSink()
+    monkeypatch.setattr("odin.cli.sys.stdout", sink)
+    args = _build_parser().parse_args(["run", str(q.root)])
+    acc = metrics.RunAccumulator(
+        run_id="t", project=project, queue=q.root, branch=None, enabled=False
+    )
+    rc = _run_loop(args, project, q, None, None, "sp", acc, _sig())  # no out=
+
+    assert rc == 0
+    written = sink.getvalue()
+    assert "odin ⏵ 1/1 myq" in written    # title at task start
+    assert "odin ✓ 1/1 myq" in written    # title at task done
+    assert "\033]9;4;1;100\007" in written  # progress bar filled to 100%
+
+
+# ----------------------------------------------------------------------
 # best-effort: a write failure never changes the exit code
 # ----------------------------------------------------------------------
 
