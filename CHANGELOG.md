@@ -44,6 +44,23 @@ with `uv tool install --from 'git+https://github.com/hglattergotz/odin@vX.Y.Z' o
   working unchanged.
 - `-y` / `--yes` no longer implies consent to recover. It skips the
   platform/model confirmation only; writing a commit requires `--recover`.
+- README documents interruption recovery and carries a **Command examples**
+  section: complete, copy-pasteable invocations with the queue name and flags
+  (including `odin run <queue> --recover --wait-for-reset` for an unattended
+  run that survives a usage limit) in place of the demo walkthrough. The same
+  examples are in `odin -h` as a **common commands** block below quickstart.
+- `odin -h` no longer describes Odin as running tasks through `claude -p`; it
+  names all three products and how to select one. Same for `odin run -h`,
+  which also now mentions stopping on an interruption.
+
+### Removed
+- **`odin demo` and the `otest` fixture project.** It was a second product
+  surface to keep working — its own scaffolded project, embedded file blobs
+  (`_demo_files.py`) and a regeneration script — that no user path went
+  through and that drifted behind the real CLI. Onboarding is `odin guide`
+  plus the README's command examples; end-to-end verification is the test
+  suite and a real queue. Gone: `src/odin/demo.py`, `src/odin/_demo_files.py`,
+  `scripts/regen_demo_files.py`, `tests/test_demo.py`.
 
 ### Fixed
 - `error: "success"` — Claude Code sets `is_error` while leaving `subtype` at

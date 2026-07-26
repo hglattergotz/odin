@@ -56,8 +56,6 @@ odin/
 │   ├── contract.py      # the protocol Odin injects via system prompt
 │   ├── git.py           # git wrapper: clean check + branch, and commit_wip
 │   ├── prompts.py       # interactive terminal Q&A + branch selection
-│   ├── demo.py          # `odin demo` scaffolder (test fixture)
-│   ├── _demo_files.py   # generated: embedded otest fixture content
 │   ├── guide.py         # `odin guide` authoring manual (self-discovery)
 │   ├── lint.py          # startup instruction-file git-conflict warnings
 │   ├── metrics.py       # central JSONL run/task metrics + report renderers
@@ -91,7 +89,6 @@ odin resume HELD_TASK [QUEUE_DIR]
 odin recover [STEM] [QUEUE_DIR] [--project PATH] [--dry-run] [--no-wip-commit]
             [--no-brief] [--verify-cmd CMD] [--wait-for-reset] [--max-wait MIN]
             [--force] [--yes]
-odin demo   DIR [--force]
 odin guide  [TOPIC]
 odin archive [QUEUE_DIR]
 odin metrics [--html [PATH]] [--project SUBSTR] [--file PATH]
@@ -136,14 +133,13 @@ cross-platform layout; `terminal` is an agent-executable iTerm2 setup manual.
 The protocol section is generated from `contract.build_system_prompt`, so it
 can't drift from runtime. Content lives in `guide.py`.
 
-`odin demo` scaffolds the `otest` throwaway target project (a `greeter` CLI
-build with a 7-task queue, including a held→resume cycle on task 005) into
-`DIR` — a repeatable end-to-end test fixture. **Demo stays Claude-only for
-v1** (CLAUDE.md + `claude` on PATH); Cursor is exercised manually via
-`odin run --platform cursor` (documented in the demo readme). `--force` wipes
-and recreates an existing demo dir (refuses if it looks like a real repo).
-The fixture content is embedded in `_demo_files.py`; scaffolding logic is in
-`demo.py`.
+There is deliberately **no `odin demo`**. The `otest` scaffolder was removed in
+0.2.5: it was a second product surface to keep working (its own fixture
+project, embedded file blobs, a regeneration script) that no user path went
+through, and it drifted behind the real CLI. End-to-end verification is the
+test suite plus running a real queue; the documented command examples in the
+README are the onboarding path it was supposed to serve. Do not reintroduce it
+without a concrete user need.
 
 `odin metrics` reads the central metrics log and prints an aggregate summary
 (run/task counts, outcomes, token usage, cost, average run/task times, peak

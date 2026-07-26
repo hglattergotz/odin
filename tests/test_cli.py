@@ -259,7 +259,7 @@ def test_no_subcommand_prints_help_not_error(capsys):
     # The overview explains what the queue is and what the input looks like.
     assert "queue/<name>/pending/" in out
     assert "NNN-slug.md" in out
-    assert "{run,status,resume,recover,demo,guide,archive,metrics,config}" in out
+    assert "{run,status,resume,recover,guide,archive,metrics,config}" in out
 
 
 def test_status_lists_each_section(setup, capsys):

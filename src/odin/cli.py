@@ -23,7 +23,6 @@ from . import __version__, completed, config, git, metrics, recovery, style, ter
 from .backends.base import AgentBackend, Failure, FailureKind
 from .backends.registry import available_platforms, get_backend
 from .contract import build_system_prompt
-from .demo import DemoError, DemoExists, create_demo
 from .guide import TOPICS, render as render_guide
 from .lint import scan_project_instructions
 from .prompts import (
@@ -58,9 +57,11 @@ def _entry() -> None:
 # ----------------------------------------------------------------------
 
 _OVERVIEW = """\
-Odin runs a queue of tasks through Claude Code (`claude -p`) one at a time,
-each in a fresh session, carrying context forward between tasks and pausing
-when the agent needs your input.
+Odin runs a queue of tasks through Claude Code (`claude`), Cursor CLI
+(`agent`) or Grok Build (`grok`) — one at a time, each in a fresh session,
+carrying context forward between tasks and pausing when the agent needs your
+input. Pick the product with --platform (or $ODIN_PLATFORM, or
+`odin config set default_platform <name>`); there is no built-in default.
 
 The queue
   Organize tasks into NAMED queues under ./queue — one sub-queue per batch of
@@ -90,10 +91,31 @@ quickstart:
   # Always use a named queue (queue/<name>/pending/), one per batch of work.
   # `odin status queue` shows every named queue at a glance; add a name to drill in.
 
+common commands:
+  # a batch on its own branch, cut from main (bare name == queue/add-search)
+  odin run add-search --platform claude --branch add-search --base main
+
+  # unattended: survive a provider usage limit — commit the partial work,
+  # sleep until the window reopens, then finish the queue in the same process
+  odin run add-search --platform claude --branch add-search --base main \\
+      --recover --wait-for-reset
+
+  odin run add-search --dry-run       # resolved argv + prompt, no agent run
+  odin run add-search --max-tasks 2   # try a new queue out, two tasks deep
+
+  odin status queue                   # every queue, most recently active first
+  odin status add-search              # drill into one
+
+  odin resume 005-schema-choice add-search   # a HELD task, once answered
+  odin recover add-search --dry-run          # a task cut off mid-work: the plan
+  odin recover add-search                    # ...then put it back to work
+
+  odin archive                        # finished sub-queues out of the overview
+  odin metrics                        # usage and cost across every project
+
 Run `odin run -h` for the full set of run options.
 Run `odin guide` for a complete task-authoring manual (an agent can read it
-to learn the format with no other context). `odin demo DIR` scaffolds a
-working example project.
+to learn the format with no other context).
 """
 
 
@@ -113,17 +135,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(
         dest="cmd",
-        metavar="{run,status,resume,recover,demo,guide,archive,metrics,config}",
+        metavar="{run,status,resume,recover,guide,archive,metrics,config}",
     )
 
     run = sub.add_parser(
         "run",
-        help="run pending tasks through claude -p",
+        help="run pending tasks through the selected agent CLI",
         description=(
-            "Run every NNN-slug.md file in <queue>/pending/ through claude -p, "
-            "in lexicographic (numeric-prefix) order, one fresh session each. "
-            "Each file's body is the task prompt. Stops when the queue drains, "
-            "a task fails, or (unattended) a task needs input."
+            "Run every NNN-slug.md file in <queue>/pending/ through the agent "
+            "CLI selected by --platform, in lexicographic (numeric-prefix) "
+            "order, one fresh session each. Each file's body is the task "
+            "prompt. Stops when the queue drains, a task fails, or "
+            "(unattended) a task needs input or is interrupted."
         ),
     )
     run.add_argument(
@@ -378,23 +401,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="don't prompt; recover and print the command to continue",
     )
     rc.set_defaults(func=_cmd_recover)
-
-    dm = sub.add_parser(
-        "demo",
-        help="scaffold the otest demo target project (a repeatable test fixture)",
-        description=(
-            "Write the 'otest' demo target project into DIR: a throwaway greeter "
-            "CLI build whose 7-task queue exercises Odin end-to-end (carry-context, "
-            "a held->resume cycle on task 005, completion). Run it with `odin run` "
-            "from DIR, then re-scaffold with --force to start over."
-        ),
-    )
-    dm.add_argument("dir", type=Path, help="directory to create the demo in")
-    dm.add_argument(
-        "--force", action="store_true",
-        help="if DIR exists and is non-empty, wipe and recreate it (reset)",
-    )
-    dm.set_defaults(func=_cmd_demo)
 
     gd = sub.add_parser(
         "guide",
@@ -1988,29 +1994,6 @@ def _continue_after_recovery(q: Queue, args: argparse.Namespace) -> int:
     if args.project:
         argv += ["--project", str(args.project)]
     return main(argv)
-
-
-# ----------------------------------------------------------------------
-# demo
-# ----------------------------------------------------------------------
-
-def _cmd_demo(args: argparse.Namespace) -> int:
-    dest = args.dir.resolve()
-    try:
-        written = create_demo(dest, force=args.force)
-    except DemoExists as e:
-        print(f"odin: {e}", file=sys.stderr)
-        return 2
-    except DemoError as e:
-        print(f"odin: {e}", file=sys.stderr)
-        return 2
-
-    print(f"odin: wrote demo project to {dest} ({len(written)} files, 7 queued tasks).")
-    print("Next steps:")
-    print(f"  cd {dest}")
-    print("  odin run --no-git          # build greeter; task 005 will ask you a question")
-    print(f"  odin demo {dest} --force   # reset and start over anytime")
-    return 0
 
 
 # ----------------------------------------------------------------------

@@ -41,8 +41,10 @@ carried forward, instead of babysitting one prompt at a time.
 3. Each task ends with a hidden sentinel: **done** (Odin carries its hand-off
    note into the next task) or **needs input** (Odin shows you the question and
    waits for an answer).
-4. The agent commits per your project instructions; Odin never commits, pushes,
-   or opens PRs. It only positions the branch.
+4. The agent commits per your project instructions; Odin only positions the
+   branch, and never pushes, merges, or opens PRs. The one commit Odin itself
+   ever makes is the WIP checkpoint during
+   [recovery](#when-a-run-gets-cut-off), and only with your consent.
 
 ## Install
 
@@ -129,6 +131,92 @@ the project. Color is emitted only to a TTY; `--no-color` (or the standard
 `NO_COLOR`, or `ODIN_NO_COLOR=1`) turns the ANSI off while keeping the glyphs
 and layout, so piped/CI output stays plain.
 
+## When a run gets cut off
+
+A task can stop for a reason that says nothing about the quality of the work:
+the agent CLI hits a **provider usage limit** mid-task, the process is killed,
+or Odin itself dies. Odin tells that apart from a genuine failure — a task the
+agent ended on its own terms without emitting a sentinel — and routes it to
+`queue/<name>/interrupted/` instead of `failed/`, alongside a
+`NNN-slug.recovery.md` sidecar recording what the attempt got done.
+
+`odin recover` puts it back to work. It commits whatever partial work is in the
+tree as a single `wip(odin): …` checkpoint (so the tree is clean and the next
+run's clean-tree check passes), merges a **resumption brief** into the task body
+— which commit holds the predecessor's work, which commit was the last real
+milestone, what it said before it stopped — and moves the task back to
+`pending/`. Plain `odin run` is the primary door: on a TTY it spots the
+interrupted task at startup and offers to recover it.
+
+**Unattended runs never commit on your behalf.** They halt at exit **12** and
+print the command instead. Two flags opt in:
+
+```sh
+# hit a usage limit at 02:00 → commit the partial work, sleep until the window
+# reopens, then carry on through the rest of the queue in the same process
+odin run add-search --platform claude --branch add-search --base main \
+    --recover --wait-for-reset
+```
+
+`--recover` authorises the WIP checkpoint commit and requeue without asking;
+`--wait-for-reset` sleeps until the reset time the provider stated, capped by
+`--max-wait` (default 360 minutes, so a 5-hour window fits). Note that `-y` /
+`--yes` deliberately does **not** imply `--recover` — it only skips the
+platform/model confirmation, and a script passing it is not thereby consenting
+to Odin writing a commit.
+
+One limitation worth knowing: if the provider's notice carries no reset time
+Odin can parse, there is nothing to sleep until. Routing to `interrupted/` still
+works (it is decided structurally, not by recognising any provider's wording),
+but the run recovers the task and stops at exit 12 rather than guessing how long
+to wait. Re-run it when the limit lifts.
+
+Repeated interruption of one task is normal — a large task legitimately spans
+several usage windows — so the circuit breaker is **progress, not attempt
+count**: two consecutive attempts with no turns and no file changes block
+further recovery (`--force` overrides), on the grounds that the problem is
+environmental rather than a limit.
+
+## Command examples
+
+```sh
+# run a named queue on its own branch, cut from main
+odin run add-search --platform claude --branch add-search --base main
+
+# same, but survive a usage limit unattended (see above)
+odin run add-search --platform claude --branch add-search --base main \
+    --recover --wait-for-reset
+
+# preview what the next task would send — resolved argv and prompt, no agent run
+odin run add-search --platform claude --dry-run
+
+# try a new queue out: run two tasks, then stop
+odin run add-search --platform claude --max-tasks 2
+
+# where does everything stand?
+odin status queue          # every named queue, most recently active first
+odin status add-search     # drill into one
+
+# a task asked you a question and is sitting in held/
+odin resume 005-schema-choice add-search
+
+# a task was cut off mid-work: see the plan first, then do it
+odin recover add-search --dry-run
+odin recover add-search
+
+# move every finished sub-queue into queue/archive/ to declutter status
+odin archive
+
+# usage and cost across every project
+odin metrics
+odin metrics --project asset-api --html
+```
+
+Bare queue names resolve under `./queue/`, so `odin run add-search` is
+`odin run queue/add-search`. Persist a platform with
+`odin config set default_platform claude` and you can drop `--platform`
+entirely.
+
 ## Help and learning the format
 
 ```sh
@@ -137,18 +225,13 @@ odin run -h      # options for a subcommand
 odin guide       # full task-authoring manual (queue layout, task files, protocol)
 ```
 
-Commands: `run`, `status`, `resume`, `archive`, `metrics`, `guide`, `demo`,
+Commands: `run`, `status`, `resume`, `recover`, `archive`, `metrics`, `guide`,
 `config`.
 
 `odin guide` prints the full authoring manual. It is exactly what your agent
 reads in [Quickest start](#quickest-start-let-your-agent-set-it-up). Topics
 include `claude-md`, `agent-md` (Cursor / AGENTS.md), `protocol`, and
-`terminal`. To try the whole flow end-to-end on a throwaway project (Claude
-Code):
-
-```sh
-odin demo /tmp/otest && cd /tmp/otest && odin run --platform claude --no-git
-```
+`terminal`.
 
 ## Development
 
