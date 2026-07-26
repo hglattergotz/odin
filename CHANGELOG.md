@@ -5,6 +5,8 @@ All notable changes to Odin are documented here. The format roughly follows
 [SemVer](https://semver.org/). Releases are git tags (`vX.Y.Z`); install one
 with `uv tool install --from 'git+https://github.com/hglattergotz/odin@vX.Y.Z' odin`.
 
+## [Unreleased]
+
 ## [0.2.5] — 2026-07-26
 
 ### Added
