@@ -8,11 +8,18 @@ from odin import style
 
 
 @pytest.fixture(autouse=True)
-def _isolate_metrics(tmp_path_factory, monkeypatch):
-    """Redirect Odin's central metrics dir to a throwaway location so the test
-    suite never appends to the user's real ~/.odin/metrics/events.jsonl."""
+def _isolate_odin_home(tmp_path_factory, monkeypatch):
+    """Point $ODIN_HOME at a throwaway dir, and drop any ambient $ODIN_CONFIG.
+
+    Two things live under it and both must be isolated: the central metrics log
+    (the suite must never append to the user's real events.jsonl) and
+    config.toml — recovery reads `[recovery]` defaults from it, so a developer's
+    own `wait_for_reset = true` would otherwise change what the tests exercise.
+    Tests that want a config write one and set $ODIN_CONFIG themselves.
+    """
     home = tmp_path_factory.mktemp("odin-home")
     monkeypatch.setenv("ODIN_HOME", str(home))
+    monkeypatch.delenv("ODIN_CONFIG", raising=False)
     yield
 
 

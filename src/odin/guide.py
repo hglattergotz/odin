@@ -436,9 +436,6 @@ Common flags (any product): `--model <id>`, `--agent-bin <path>`, `--yes`
 default with `odin config set default_platform cursor` (or `grok`). Full
 flag list: `odin run -h`. Product map: §3b and `docs/agent-backends.md`.
 
-Run `odin demo DIR` to scaffold a complete working example (Claude Code only
-for v1; the demo readme notes a manual Cursor CLI smoke-test).
-
 On a TTY the Odin tab shows live status (title + progress bar; `--notify` adds
 iTerm2 attention/color), so you can leave a batch running and glance over.
 
