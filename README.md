@@ -165,6 +165,22 @@ odin run add-search --platform claude --branch add-search --base main \
 platform/model confirmation, and a script passing it is not thereby consenting
 to Odin writing a commit.
 
+Both flags have standing equivalents in `~/.odin/config.toml`, so a machine
+that should always behave this way doesn't need them on every run:
+
+```toml
+[recovery]
+wait_for_reset = true                # sleep for a stated reset without asking
+max_wait_minutes = 300               # ...but never longer than this
+auto_recover = false                 # never offer to recover at startup
+verify_command = "go build ./..."    # output folded into the resumption brief
+```
+
+An explicit flag always beats config — `--recover` recovers even with
+`auto_recover = false`. Note there is deliberately **no** config key that
+authorises the WIP commit in an unattended run: that stays a per-invocation
+decision you make with `--recover`.
+
 One limitation worth knowing: if the provider's notice carries no reset time
 Odin can parse, there is nothing to sleep until. Routing to `interrupted/` still
 works (it is decided structurally, not by recognising any provider's wording),

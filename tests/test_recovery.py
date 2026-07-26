@@ -564,6 +564,84 @@ def test_ctrl_c_during_wait_stops_cleanly():
 
 
 # ----------------------------------------------------------------------
+# [recovery] config defaults
+# ----------------------------------------------------------------------
+# The flags are the documented surface, but a user who always wants this
+# behaviour should not have to retype it on every run. Config is the standing
+# default; an explicit flag always wins over it.
+
+class _FakeStdin:
+    def __init__(self, tty: bool) -> None:
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+def _run_args(*extra: str):
+    """Real argparse defaults, so these tests can't drift from the parser."""
+    from odin.cli import _build_parser
+    return _build_parser().parse_args(["run", "queue/x", *extra])
+
+
+def _with_config(tmp_path: Path, monkeypatch, body: str) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(body, encoding="utf-8")
+    monkeypatch.setenv("ODIN_CONFIG", str(cfg))
+
+
+def test_config_wait_for_reset_waits_without_the_flag(tmp_path, monkeypatch):
+    import io
+
+    from odin.cli import _should_wait
+    monkeypatch.setattr("odin.cli.sys.stdin", _FakeStdin(False))
+    resets = datetime.now().astimezone() + timedelta(minutes=10)
+
+    assert not _should_wait(_run_args(), resets, out=io.StringIO())
+    _with_config(tmp_path, monkeypatch, "[recovery]\nwait_for_reset = true\n")
+    assert _should_wait(_run_args(), resets, out=io.StringIO())
+
+
+def test_config_max_wait_minutes_is_the_default_cap(tmp_path, monkeypatch):
+    from odin.cli import _max_wait
+
+    assert _max_wait(_run_args()) == wait.DEFAULT_MAX_WAIT_MINUTES
+    _with_config(tmp_path, monkeypatch, "[recovery]\nmax_wait_minutes = 45\n")
+    assert _max_wait(_run_args()) == 45
+    # An explicit flag beats the standing default.
+    assert _max_wait(_run_args("--max-wait", "5")) == 5
+
+
+def test_config_cap_can_refuse_a_wait_the_flag_asked_for(tmp_path, monkeypatch):
+    """`wait_for_reset` says yes, `max_wait_minutes` still gets the last word."""
+    import io
+
+    from odin.cli import _should_wait
+    monkeypatch.setattr("odin.cli.sys.stdin", _FakeStdin(False))
+    _with_config(
+        tmp_path, monkeypatch,
+        "[recovery]\nwait_for_reset = true\nmax_wait_minutes = 30\n",
+    )
+    out = io.StringIO()
+    resets = datetime.now().astimezone() + timedelta(hours=4)
+    assert not _should_wait(_run_args(), resets, out=out)
+    assert "beyond the 30-minute cap" in out.getvalue()
+
+
+def test_config_auto_recover_false_suppresses_the_offer(tmp_path, monkeypatch):
+    from odin.cli import _may_recover
+
+    monkeypatch.setattr("odin.cli.sys.stdin", _FakeStdin(True))
+    monkeypatch.setattr("odin.cli.ask_continue", lambda *a, **k: True)
+    assert _may_recover(_run_args())
+
+    _with_config(tmp_path, monkeypatch, "[recovery]\nauto_recover = false\n")
+    assert not _may_recover(_run_args())
+    # ...but typing --recover still means it.
+    assert _may_recover(_run_args("--recover"))
+
+
+# ----------------------------------------------------------------------
 # CLI wiring
 # ----------------------------------------------------------------------
 

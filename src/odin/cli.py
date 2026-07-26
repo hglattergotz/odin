@@ -1276,11 +1276,17 @@ def _may_recover(args: argparse.Namespace) -> bool:
     Note that `--yes` deliberately does NOT count. It means "skip the
     platform/model confirmation", and a script that passes it is not thereby
     consenting to Odin writing a commit. Only `--recover` authorises that.
+
+    `recovery.auto_recover = false` in config suppresses the TTY offer the same
+    way `--no-auto-recover` does, but an explicit `--recover` still wins: a
+    flag typed on the command line beats a standing default.
     """
     if getattr(args, "no_auto_recover", False):
         return False
     if getattr(args, "recover", False):
         return True
+    if not config.recovery_auto():
+        return False
     if not sys.stdin.isatty():
         return False  # never commit on a user's behalf in an unattended run
     return ask_continue("Recover and continue?", default=True)
@@ -1295,7 +1301,7 @@ def _should_wait(
             f"   reset is beyond the {_max_wait(args)}-minute cap — not waiting."
         ), file=out)
         return False
-    if getattr(args, "wait_for_reset", False):
+    if getattr(args, "wait_for_reset", False) or config.recovery_wait_for_reset():
         return True
     if not sys.stdin.isatty():
         return False
@@ -1304,7 +1310,12 @@ def _should_wait(
 
 
 def _max_wait(args: argparse.Namespace) -> int:
-    return getattr(args, "max_wait", None) or wait.DEFAULT_MAX_WAIT_MINUTES
+    """Wait cap: the flag, else `recovery.max_wait_minutes`, else the default."""
+    return (
+        getattr(args, "max_wait", None)
+        or config.recovery_max_wait_minutes()
+        or wait.DEFAULT_MAX_WAIT_MINUTES
+    )
 
 
 def _resolve_verify_cmd(args: argparse.Namespace) -> str | None:

@@ -63,6 +63,11 @@ with `uv tool install --from 'git+https://github.com/hglattergotz/odin@vX.Y.Z' o
   `scripts/regen_demo_files.py`, `tests/test_demo.py`.
 
 ### Fixed
+- The `[recovery]` config table is now actually consulted. `auto_recover`,
+  `wait_for_reset` and `max_wait_minutes` had accessors in `config.py` that
+  nothing ever called, so only `verify_command` worked. An explicit flag still
+  beats config, and no config key can authorise the WIP commit — that stays
+  `--recover`, per invocation.
 - `error: "success"` — Claude Code sets `is_error` while leaving `subtype` at
   `"success"` when a session is cut short, which Odin reported as the literal
   string `success`. Five of six historical failures carried this nonsense
