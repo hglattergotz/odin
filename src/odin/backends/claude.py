@@ -19,11 +19,22 @@ The success gate that used to live in `runner.py` lives here now (in
 
 from __future__ import annotations
 
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TextIO
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from odin import style
-from odin.backends.base import AgentBackend, AgentInvokeSpec, CapturedFields, RunOptions
+from odin.backends.base import (
+    AgentBackend,
+    AgentInvokeSpec,
+    CapturedFields,
+    Failure,
+    FailureKind,
+    RunOptions,
+    ended_on_agents_terms,
+)
 from odin.runner import (
     RunResult,
     _assistant_text,
@@ -36,6 +47,113 @@ from odin.runner import (
 
 #: Claude stop reasons that count as a clean, complete turn.
 _GOOD_STOPS = {"end_turn", "stop_sequence"}
+
+
+def _error_label(terminal_event: dict) -> str | None:
+    """Human-meaningful error label for a terminal `result` event, or None.
+
+    Claude Code can set ``is_error`` while leaving ``subtype`` at ``"success"``
+    — the signature of a session cut short (usage limit, hard kill) rather than
+    a clean failure. Naming the subtype in that case produced the nonsense
+    ``error: success``, so say what actually happened instead. Everything else
+    keeps the original semantics: a real subtype passes through, and an absent
+    one is "unknown error".
+    """
+    subtype = terminal_event.get("subtype")
+    if not (terminal_event.get("is_error") or subtype != "success"):
+        return None
+    if subtype and subtype != "success":
+        return subtype
+    if subtype == "success":
+        # Only reachable with is_error truthy — the interrupted-session shape.
+        return "agent reported is_error with subtype=success"
+    return "unknown error"
+
+
+# ----------------------------------------------------------------------
+# provider-limit recognition (enrichment only — never routing)
+# ----------------------------------------------------------------------
+# Odin decides *that* a run was interrupted structurally (see
+# `ended_on_agents_terms`); these patterns only add *why* and *until when*.
+# An unrecognised limit notice still classifies as interrupted — it just says
+# reason="unknown" and offers no wait. Extend freely; nothing depends on a
+# match succeeding.
+
+_LIMIT_PATTERNS = (
+    re.compile(r"usage limit reached", re.I),
+    re.compile(r"session limit", re.I),
+    re.compile(r"\brate[ _-]?limit", re.I),
+    re.compile(r"quota (?:exceeded|exhausted)", re.I),
+    re.compile(r"\b429\b"),
+    re.compile(r"resets?\s+(?:at\s+)?\d", re.I),
+)
+
+#: `Claude AI usage limit reached|1753462800` — the most reliable form there is.
+_EPOCH_RE = re.compile(r"limit reached\|(\d{10,13})\b", re.I)
+
+#: `resets 3pm (America/New_York)`, `resets at 15:00`, `resets 3:30 pm`
+_CLOCK_RE = re.compile(
+    r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?"
+    r"(?:\s*\(([A-Za-z_]+/[A-Za-z_+\-]+)\))?",
+    re.I,
+)
+
+#: The line worth showing the user, if we can find one.
+_DETAIL_RE = re.compile(r"^.*(?:usage limit|session limit|rate.?limit).*$", re.I | re.M)
+
+
+def parse_reset_time(text: str, *, now: datetime | None = None) -> datetime | None:
+    """Extract the moment a provider limit lifts, or None if not stated.
+
+    Handles the epoch form and the human clock form (with or without an explicit
+    IANA zone). A bare clock time is read in the stated zone, else local time,
+    and rolled to tomorrow when it has already passed today. Returns an aware
+    datetime. Never raises — an unparseable notice just yields None.
+    """
+    if not text:
+        return None
+    now = now or datetime.now().astimezone()
+
+    m = _EPOCH_RE.search(text)
+    if m:
+        raw = int(m.group(1))
+        secs = raw / 1000 if raw > 10_000_000_000 else raw
+        try:
+            return datetime.fromtimestamp(secs, tz=timezone.utc).astimezone()
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    m = _CLOCK_RE.search(text)
+    if not m:
+        return None
+    hour = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    meridiem = (m.group(3) or "").replace(".", "").lower()
+    if meridiem == "pm" and hour < 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+
+    tz = now.tzinfo
+    if m.group(4):
+        try:
+            tz = ZoneInfo(m.group(4))
+        except (ZoneInfoNotFoundError, ValueError):
+            pass  # unknown zone name — fall back to local
+
+    local_now = now.astimezone(tz)
+    reset = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if reset <= local_now:
+        reset += timedelta(days=1)  # stated time already passed → it means tomorrow
+    return reset
+
+
+def _limit_detail(text: str) -> str:
+    """The most useful single line from a limit notice, trimmed."""
+    m = _DETAIL_RE.search(text or "")
+    return " ".join(m.group(0).split())[:200] if m else ""
 
 
 class ClaudeBackend(AgentBackend):
@@ -111,7 +229,12 @@ class ClaudeBackend(AgentBackend):
                     _safe_write(out, "\n")
             for name, detail in _tool_calls(event, project_dir):
                 _write_tool_line(out, name, detail)
-            return None
+            # Hand the text to the loop's bounded tail buffer as well. Normally
+            # the terminal `result` event carries the whole final message and
+            # this is unused — but when the CLI is killed hard there IS no
+            # terminal event, and this tail is then the only record of what the
+            # agent was doing (see normalise_result's fallback).
+            return {"text_delta": text} if text else None
 
         if etype == "user":
             # Tool results — keep the terminal quiet unless there's an error.
@@ -131,11 +254,57 @@ class ClaudeBackend(AgentBackend):
                 "stop_reason": event.get("stop_reason"),
                 "session_id": event.get("session_id"),
             }
-            if event.get("is_error") or event.get("subtype") != "success":
-                captured["error"] = event.get("subtype") or "unknown error"
+            error = _error_label(event)
+            if error is not None:
+                captured["error"] = error
             return captured
 
         return None
+
+    def classify_failure(self, result: RunResult) -> Failure:
+        """Interrupted vs. defect, in three tiers (proposal §4).
+
+        1. A recognised provider-limit notice → INTERRUPTED, "confirmed", with
+           the reset time when the notice carries one.
+        2. The turn did not end on the agent's own terms → INTERRUPTED,
+           "probable". This is the tier that makes the classification correct
+           without any message matching; tier 1 only enriches it.
+        3. Otherwise the agent finished and broke the protocol → DEFECT.
+        """
+        # `--max-turns` is the user's own circuit breaker, not something
+        # external cutting the agent off. Recovering it would commit the partial
+        # work and re-run straight back into the same cap — so it stays a defect
+        # the user is told about, exactly as before.
+        if result.error == "error_max_turns":
+            return Failure(
+                kind=FailureKind.DEFECT,
+                confidence="confirmed",
+                reason="max_turns",
+                detail="hit the --max-turns cap mid-work",
+            )
+
+        haystack = f"{result.final_text}\n{result.stderr}"
+        if any(p.search(haystack) for p in _LIMIT_PATTERNS):
+            return Failure(
+                kind=FailureKind.INTERRUPTED,
+                confidence="confirmed",
+                reason="usage_limit",
+                detail=_limit_detail(haystack),
+                resets_at=parse_reset_time(haystack),
+            )
+        if not ended_on_agents_terms(result):
+            return Failure(
+                kind=FailureKind.INTERRUPTED,
+                confidence="probable",
+                reason="unknown",
+                detail=(result.error or "").strip()[:200],
+            )
+        return Failure(
+            kind=FailureKind.DEFECT,
+            confidence="probable",
+            reason="no_sentinel",
+            detail="the agent ended its turn without emitting a sentinel block",
+        )
 
     def normalise_result(
         self,
@@ -171,8 +340,14 @@ class ClaudeBackend(AgentBackend):
             duration_ms = terminal_event.get("duration_ms")
             api_ms = terminal_event.get("duration_api_ms")
             num_turns = terminal_event.get("num_turns")
-            if terminal_event.get("is_error") or terminal_event.get("subtype") != "success":
-                error = terminal_event.get("subtype") or "unknown error"
+            error = _error_label(terminal_event)
+
+        # A hard kill (SIGKILL, OOM, dropped connection) produces no terminal
+        # event at all, leaving nothing to diagnose or to build a resumption
+        # brief from. Fall back to the streamed tail so the agent's last words
+        # survive. Never overrides a real terminal `result`.
+        if not final_text:
+            final_text = accumulated_text
 
         succeeded = (
             exit_code == 0
@@ -188,6 +363,7 @@ class ClaudeBackend(AgentBackend):
             exit_code=exit_code,
             session_id=session_id,
             platform=self.name,
+            stderr=stderr,
             wall_ms=wall_ms,
             duration_ms=duration_ms,
             api_ms=api_ms,

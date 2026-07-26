@@ -147,6 +147,47 @@ def resolve_model(
 
 
 # ---------------------------------------------------------------------------
+# [recovery] — interruption recovery defaults
+# ---------------------------------------------------------------------------
+
+def _recovery_section(config: dict | None = None) -> dict:
+    if config is None:
+        config = load_config()
+    section = config.get("recovery")
+    return section if isinstance(section, dict) else {}
+
+
+def recovery_verify_command(config: dict | None = None) -> str | None:
+    """Command whose output is folded into the resumption brief, or None.
+
+    Unset by default and deliberately so: Odin must not guess a project's build
+    command. When it *is* set, a recovering agent starts out knowing exactly
+    what is broken instead of having to infer it.
+    """
+    cmd = _recovery_section(config).get("verify_command")
+    return cmd.strip() if isinstance(cmd, str) and cmd.strip() else None
+
+
+def recovery_max_wait_minutes(config: dict | None = None) -> int | None:
+    """Cap on sleeping for a provider reset window, or None for the default."""
+    val = _recovery_section(config).get("max_wait_minutes")
+    return int(val) if isinstance(val, (int, float)) and val > 0 else None
+
+
+def recovery_wait_for_reset(config: dict | None = None) -> bool:
+    """Wait for a stated reset without asking. Off by default — a process that
+    silently idles for hours must be something the user opted into."""
+    return bool(_recovery_section(config).get("wait_for_reset", False))
+
+
+def recovery_auto(config: dict | None = None) -> bool:
+    """Offer recovery at startup on a TTY. On by default; `--no-auto-recover`
+    or `recovery.auto_recover = false` turns the offer off."""
+    val = _recovery_section(config).get("auto_recover", True)
+    return bool(val)
+
+
+# ---------------------------------------------------------------------------
 # dotted-key access (get/set on the nested config dict)
 # ---------------------------------------------------------------------------
 

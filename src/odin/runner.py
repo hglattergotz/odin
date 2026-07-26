@@ -36,6 +36,12 @@ if TYPE_CHECKING:  # import only for typing — avoids loading the backends pack
     from odin.backends.base import AgentBackend, RunOptions
 
 
+#: Cap on retained streamed assistant text, in characters. Generous enough to
+#: hold any realistic final message plus its sentinel block, small enough that a
+#: long multi-turn session doesn't grow unbounded. Trimmed from the front.
+_TEXT_TAIL_LIMIT = 64 * 1024
+
+
 @dataclass(frozen=True)
 class RunResult:
     succeeded: bool          # backend-classified terminal outcome
@@ -45,6 +51,10 @@ class RunResult:
     exit_code: int
     session_id: str | None
     platform: str = "claude"  # which backend produced this result
+    #: Raw stderr from the agent CLI. Retained because provider limit notices
+    #: often land here rather than in the event stream, and failure
+    #: classification reads it (see AgentBackend.classify_failure).
+    stderr: str = ""
     # Metrics captured from the terminal event + our own timing.
     # All optional so a missing/older terminal event never breaks construction.
     wall_ms: int = 0                  # Odin-measured subprocess wall time
@@ -150,6 +160,7 @@ def run_agent(
         # terminal field). The loop does not assume type == "result".
         terminal_event: dict | None = None
         text_parts: list[str] = []
+        text_len = 0
 
         for line in proc.stdout:
             line = line.rstrip("\n")
@@ -164,6 +175,14 @@ def run_agent(
             delta = captured.get("text_delta")
             if isinstance(delta, str) and delta:
                 text_parts.append(delta)
+                text_len += len(delta)
+                # Keep only the tail. Backends that build their final text from
+                # this (Grok) put the protocol block last, and backends that use
+                # it only as a hard-kill fallback (Claude) want the last thing
+                # said — either way the tail is the part worth keeping, and an
+                # 85-turn session must not accumulate megabytes.
+                while text_len > _TEXT_TAIL_LIMIT and len(text_parts) > 1:
+                    text_len -= len(text_parts.pop(0))
             if captured.get("terminal"):
                 terminal_event = event
 

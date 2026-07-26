@@ -5,10 +5,17 @@ Layout (relative to a queue root):
     pending/   NNN-slug.md   — waiting, picked in lexicographic order
     running/   NNN-slug.md   — at most one in flight
     done/      NNN-slug.md   — completed successfully
-    failed/    NNN-slug.md   — non-zero exit, unparseable output, etc.
+    failed/    NNN-slug.md   — the agent finished but broke the protocol
     held/      NNN-slug.md           — blocked on questions (original task body)
                NNN-slug.questions.md — questions + Answers heading
+    interrupted/ NNN-slug.md          — cut off mid-work; recoverable
+                 NNN-slug.recovery.md — evidence, attempt log, resumption brief
     carry/     NNN-slug.next-context.md — carry-forward from prior task
+
+`interrupted/` deliberately mirrors `held/`: a task body plus a sidecar, and a
+resume-style merge that folds the sidecar's brief into the body on the way back
+to `pending/`. Keeping it out of `failed/` preserves that directory's meaning —
+a human must look at this — and lets `odin status` offer a real next action.
 
 We never delete queue files; we only move them between subdirs. The audit
 trail of where each task ended up matters more than tidy directories.
@@ -21,7 +28,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-SUBDIRS = ("pending", "running", "done", "failed", "held", "carry", "backlog")
+SUBDIRS = (
+    "pending", "running", "done", "failed", "held", "interrupted", "carry", "backlog",
+)
 
 # `odin archive` moves whole finished sub-queues under <container>/archive/<name>/
 # so the container overview only shows work still in flight. The archive dir is
@@ -30,7 +39,16 @@ ARCHIVE_DIRNAME = "archive"
 
 # A sub-queue is archivable only when nothing actionable remains — everything
 # ran and succeeded. These states each block archiving (with a reason).
-_ARCHIVE_BLOCKERS = ("pending", "running", "held", "failed", "backlog")
+_ARCHIVE_BLOCKERS = (
+    "pending", "running", "held", "interrupted", "failed", "backlog",
+)
+
+#: Delimiters around the resumption brief inside a recovered task body. They
+#: exist so a *second* recovery replaces the previous brief instead of stacking
+#: another one on top — otherwise a task interrupted three times would lead with
+#: its oldest, most misleading account of the world.
+BRIEF_OPEN = "<!-- odin:resumption-brief -->"
+BRIEF_CLOSE = "<!-- /odin:resumption-brief -->"
 
 
 @dataclass(frozen=True)
@@ -90,6 +108,7 @@ class Queue:
             "pending": len(self.pending()),
             "running": len(self.running()),
             "held": len(self.held()),
+            "interrupted": len(self.interrupted()),
             "done": len(self.done()),
             "failed": len(self.failed()),
             "backlog": len(self.backlog()),
@@ -99,7 +118,9 @@ class Queue:
         """True if no task files live in any working subdir of this queue."""
         return not any(
             self._list(s)
-            for s in ("pending", "running", "held", "done", "failed", "backlog")
+            for s in (
+                "pending", "running", "held", "interrupted", "done", "failed", "backlog",
+            )
         )
 
     def subqueues(self) -> list[str]:
@@ -165,6 +186,31 @@ class Queue:
             if not t.name.endswith(".questions.md")
         ]
 
+    def interrupted(self) -> list[Task]:
+        """Interrupted tasks — bodies only, not the *.recovery.md sidecars."""
+        return [
+            t for t in self._list("interrupted")
+            if not t.name.endswith(".recovery.md")
+        ]
+
+    def stranded_running(self) -> list[Task]:
+        """Task files left in running/ by an odin process that never finished.
+
+        Nothing else ever looks in `running/` — `next_pending` reads only
+        `pending/` — so without this a Ctrl-C or a closed laptop orphans the
+        task permanently. Recovery adopts these the same way it adopts an
+        interrupted task; there is no in-flight run to race with, because a
+        living run holds at most one file here and exits through `_route`.
+        """
+        return self.running()
+
+    def recoverable(self) -> list[Task]:
+        """Everything `odin recover` could act on, interrupted first."""
+        return self.interrupted() + self.stranded_running()
+
+    def recovery_path(self, stem: str) -> Path:
+        return self.root / "interrupted" / f"{stem}.recovery.md"
+
     def next_pending(self) -> Task | None:
         items = self.pending()
         return items[0] if items else None
@@ -202,6 +248,47 @@ class Queue:
             encoding="utf-8",
         )
         return moved
+
+    def mark_interrupted(self, task: Task, sidecar_body: str) -> Task:
+        """Move a cut-off task to interrupted/ and write its recovery sidecar.
+
+        `sidecar_body` is rendered by `recovery.py` and already carries the full
+        attempt history, so a second interruption simply overwrites the file
+        with a longer record rather than losing the earlier attempts.
+        """
+        moved = self._move(task, "interrupted")
+        self.recovery_path(moved.stem).write_text(sidecar_body, encoding="utf-8")
+        return moved
+
+    def recover_interrupted(self, stem: str, brief: str = "") -> Task:
+        """Move an interrupted task back to pending/, with the brief prepended.
+
+        The counterpart of `resume_held`: where that pairs the agent's questions
+        with the user's answers, this pairs the task with an account of what its
+        own interrupted attempt already did. Both re-run in a fresh session, so
+        the merged body is the only way that context survives.
+
+        Re-recovering a task replaces any brief already in the body rather than
+        stacking a second one. The sidecar stays in interrupted/ as the audit
+        record; only the body moves.
+        """
+        body_path = self.root / "interrupted" / f"{stem}.md"
+        if not body_path.exists():
+            raise FileNotFoundError(f"no interrupted task body at {body_path}")
+
+        original = strip_brief(body_path.read_text(encoding="utf-8"))
+        merged = (
+            f"{BRIEF_OPEN}\n{brief.strip()}\n{BRIEF_CLOSE}\n\n---\n\n{original}"
+            if brief.strip() else original
+        )
+        pending_path = self.root / "pending" / f"{stem}.md"
+        pending_path.write_text(merged, encoding="utf-8")
+        body_path.unlink()
+        return Task.from_path(pending_path)
+
+    def adopt_stranded(self, task: Task, sidecar_body: str) -> Task:
+        """Treat a file stranded in running/ as interrupted (same destination)."""
+        return self.mark_interrupted(task, sidecar_body)
 
     def record_answers(self, stem: str, answers_text: str) -> None:
         """Append answers under the existing '## Answers' heading of a held file.
@@ -413,6 +500,17 @@ def _safe_mtime(p: Path) -> float:
 # ----------------------------------------------------------------------
 # helpers
 # ----------------------------------------------------------------------
+
+_BRIEF_BLOCK_RE = re.compile(
+    re.escape(BRIEF_OPEN) + r".*?" + re.escape(BRIEF_CLOSE) + r"\s*(?:---\s*)?",
+    re.DOTALL,
+)
+
+
+def strip_brief(body: str) -> str:
+    """Remove any previously merged resumption brief from a task body."""
+    return _BRIEF_BLOCK_RE.sub("", body, count=1).lstrip("\n")
+
 
 _QUESTIONS_HEADING_RE = re.compile(r"^## Questions\s*$", re.MULTILINE)
 _ANSWERS_HEADING_RE = re.compile(r"^## Answers\s*$", re.MULTILINE)

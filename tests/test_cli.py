@@ -259,7 +259,7 @@ def test_no_subcommand_prints_help_not_error(capsys):
     # The overview explains what the queue is and what the input looks like.
     assert "queue/<name>/pending/" in out
     assert "NNN-slug.md" in out
-    assert "{run,status,resume,demo,guide,archive,metrics,config}" in out
+    assert "{run,status,resume,recover,demo,guide,archive,metrics,config}" in out
 
 
 def test_status_lists_each_section(setup, capsys):
@@ -1188,7 +1188,7 @@ def test_status_on_real_queue_lists(tmp_path, capsys):
     rc = main(["status", str(q.root)])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "done     (1)" in out
+    assert "done        (1)" in out
     assert "001-x.md" in out
 
 

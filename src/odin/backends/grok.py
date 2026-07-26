@@ -169,6 +169,7 @@ class GrokBackend(AgentBackend):
             exit_code=exit_code,
             session_id=session_id,
             platform=self.name,
+            stderr=stderr,
             wall_ms=wall_ms,
             duration_ms=None,
             api_ms=None,

@@ -242,7 +242,7 @@ def test_aggregate_and_concurrency(tmp_path):
     agg = metrics.aggregate(events, path=path)
     assert agg["n_tasks"] == 3
     assert agg["n_runs"] == 2
-    assert agg["outcomes"] == {"completed": 1, "held": 1, "failed": 1}
+    assert agg["outcomes"] == {"completed": 1, "held": 1, "interrupted": 0, "failed": 1}
     assert abs(agg["cost_total"] - 0.3) < 1e-9
     assert agg["tokens_total"]["input"] == 80
     assert agg["peak_concurrency"] == 2
