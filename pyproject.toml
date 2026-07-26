@@ -1,6 +1,6 @@
 [project]
 name = "odin"
-version = "0.2.6.dev0"
+version = "0.2.6"
 description = "Headless multi-platform task orchestrator"
 readme = "README.md"
 license = "MIT"

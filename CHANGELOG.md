@@ -5,7 +5,20 @@ All notable changes to Odin are documented here. The format roughly follows
 [SemVer](https://semver.org/). Releases are git tags (`vX.Y.Z`); install one
 with `uv tool install --from 'git+https://github.com/hglattergotz/odin@vX.Y.Z' odin`.
 
-## [Unreleased]
+## [0.2.6] — 2026-07-26
+
+### Fixed
+- **The terminal tab title and progress bar were dead in 0.2.5.** `_run_loop`
+  builds its `_Signaler` from an `out` parameter whose default changed from
+  `sys.stdout` to `None` when `_stdout()` was introduced to resolve sinks at
+  call time; the loop was never updated to call it, and `_cmd_run` passes no
+  `out`. Every `out.isatty()` in `term.py` then raised into its best-effort
+  swallow, so titles, the OSC 9;4 progress bar, tab color, attention and
+  notifications all silently stopped. Nothing errored, by construction — the
+  signaling layer is designed never to sink a run.
+- Regression test drives `_run_loop` through its **default** sink. Every
+  existing signaling test injects `out=`, which is exactly how this shipped:
+  the default is the one path production takes and the only one untested.
 
 ## [0.2.5] — 2026-07-26
 
