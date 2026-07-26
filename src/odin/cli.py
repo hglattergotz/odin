@@ -1,23 +1,26 @@
 """odin CLI — argparse entry point.
 
 Subcommands:
-  odin run    [QUEUE]  --project P  --max-tasks N  --allowed-tools CSV ...
-  odin status [QUEUE]
-  odin resume STEM     [QUEUE]
+  odin run     [QUEUE]  --project P  --max-tasks N  --allowed-tools CSV ...
+  odin status  [QUEUE]
+  odin resume  STEM     [QUEUE]   — a held task, after answering its questions
+  odin recover [STEM]   [QUEUE]   — a task cut off mid-work
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TextIO
 
-from . import __version__, completed, config, git, metrics, style, term
-from .backends.base import AgentBackend
+from . import __version__, completed, config, git, metrics, recovery, style, term, wait
+from .backends.base import AgentBackend, Failure, FailureKind
 from .backends.registry import available_platforms, get_backend
 from .contract import build_system_prompt
 from .demo import DemoError, DemoExists, create_demo
@@ -109,7 +112,8 @@ def _build_parser() -> argparse.ArgumentParser:
         version=f"odin {__version__} (from {_pkg_dir})",
     )
     sub = p.add_subparsers(
-        dest="cmd", metavar="{run,status,resume,demo,guide,archive,metrics,config}"
+        dest="cmd",
+        metavar="{run,status,resume,recover,demo,guide,archive,metrics,config}",
     )
 
     run = sub.add_parser(
@@ -252,6 +256,43 @@ def _build_parser() -> argparse.ArgumentParser:
              "off by default)",
     )
     run.add_argument(
+        "--recover", action="store_true",
+        help="recover an interrupted task without asking (commit its partial "
+             "work as a WIP checkpoint and requeue it). Needed for unattended "
+             "runs, which otherwise halt at exit 12 rather than committing.",
+    )
+    run.add_argument(
+        "--no-auto-recover", action="store_true",
+        help="never offer to recover an interrupted task at startup; just "
+             "report it and stop",
+    )
+    run.add_argument(
+        "--wait-for-reset", action="store_true",
+        help="when a provider states when its usage limit lifts, sleep until "
+             "then and carry on instead of asking (also caps at --max-wait)",
+    )
+    run.add_argument(
+        "--max-wait", type=int, default=None, metavar="MINUTES",
+        help=f"longest a reset wait may be (default: {wait.DEFAULT_MAX_WAIT_MINUTES}); "
+             "a reset further out than this is reported, not waited for",
+    )
+    run.add_argument(
+        "--no-wip-commit", action="store_true",
+        help="on recovery, leave the interrupted work uncommitted. The tree "
+             "then stays dirty, so the run also needs --allow-dirty.",
+    )
+    run.add_argument(
+        "--allow-dirty", action="store_true",
+        help="start even though the working tree is not clean (the clean-tree "
+             "check is otherwise a hard stop)",
+    )
+    run.add_argument(
+        "--verify-cmd", default=None, metavar="CMD",
+        help="command run in the project during recovery whose output is added "
+             "to the resumption brief, e.g. 'go build ./...'. Overrides "
+             "recovery.verify_command in config.",
+    )
+    run.add_argument(
         "--dry-run", action="store_true",
         help="show what would run without invoking the agent",
     )
@@ -276,6 +317,67 @@ def _build_parser() -> argparse.ArgumentParser:
     rs.add_argument("stem", help="task stem, e.g. 001-add-readme")
     rs.add_argument("queue", nargs="?", default="./queue", type=Path)
     rs.set_defaults(func=_cmd_resume)
+
+    rc = sub.add_parser(
+        "recover",
+        help="put an interrupted task back to work (commit WIP + requeue)",
+        description=(
+            "Recover a task that was cut off mid-work — a provider usage limit, "
+            "a hard kill, or an odin process that never finished. Commits the "
+            "partial work it left as a single WIP checkpoint (so the tree is "
+            "clean and the run can restart), merges a resumption brief into the "
+            "task so the next agent knows it is continuing rather than starting "
+            "fresh, and moves it back to pending/. Distinct from `odin resume`, "
+            "which answers a held task's questions."
+        ),
+    )
+    rc.add_argument(
+        "stem", nargs="?", default=None,
+        help="task stem, e.g. 080-ui-port (optional when only one task is "
+             "recoverable)",
+    )
+    rc.add_argument("queue", nargs="?", default="./queue", type=Path)
+    rc.add_argument(
+        "--project", default=None, type=Path,
+        help="target project directory (default: current working directory)",
+    )
+    rc.add_argument(
+        "--dry-run", action="store_true",
+        help="print the plan and the exact resumption brief, and write nothing",
+    )
+    rc.add_argument(
+        "--no-wip-commit", action="store_true",
+        help="leave the interrupted work uncommitted (the next run then needs "
+             "--allow-dirty)",
+    )
+    rc.add_argument(
+        "--no-brief", action="store_true",
+        help="merge only a one-line retry note instead of the full resumption "
+             "brief",
+    )
+    rc.add_argument(
+        "--verify-cmd", default=None, metavar="CMD",
+        help="command run in the project whose output is added to the brief, "
+             "e.g. 'go build ./...'",
+    )
+    rc.add_argument(
+        "--wait-for-reset", action="store_true",
+        help="if a provider reset time is known, sleep until then without asking",
+    )
+    rc.add_argument(
+        "--max-wait", type=int, default=None, metavar="MINUTES",
+        help=f"longest a reset wait may be (default: {wait.DEFAULT_MAX_WAIT_MINUTES})",
+    )
+    rc.add_argument(
+        "--force", action="store_true",
+        help="recover even though the last two attempts made no progress "
+             "(which usually means the problem is not a usage limit)",
+    )
+    rc.add_argument(
+        "-y", "--yes", action="store_true",
+        help="don't prompt; recover and print the command to continue",
+    )
+    rc.set_defaults(func=_cmd_recover)
 
     dm = sub.add_parser(
         "demo",
@@ -429,6 +531,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # Missing-instruction warning must run *after* backend resolution so an
     # AGENTS.md-only Cursor project is not falsely flagged for CLAUDE.md.
     _warn_missing_instructions(project, backend)
+
+    # Leftovers from a previous session, before anything else touches git: a
+    # task cut off mid-work, or one stranded in running/ by an odin process that
+    # died. Recovering here is what lets plain `odin run` be the primary door —
+    # and it has to precede the clean-tree check, since the whole point is that
+    # the tree is dirty because of the interruption.
+    if not args.dry_run:
+        halt = _startup_recovery(args, project, q)
+        if halt is not None:
+            return halt
 
     # Pre-run platform/model confirmation. Skipped on --dry-run (argv preview
     # is enough) and --yes (scripts). Non-TTY gets a one-line info print and
@@ -754,7 +866,7 @@ def _run_loop(
     backend=None,
     model: str | None = None,
     branch: str | None = None,
-    out: TextIO = sys.stdout,
+    out: TextIO | None = None,
 ) -> int:
     """The task-processing loop. Records each task into `acc` and returns the
     process exit code; the caller writes the run summary."""
@@ -819,7 +931,12 @@ def _run_loop(
             system_prompt=system_prompt,
             run_options=run_options,
         )
-        outcome, questions, follow_ups = _route(q, running, result)
+        outcome, questions, follow_ups, failure = _route(
+            q, running, result,
+            # `branch is None` means git is unmanaged (--no-git / not a repo);
+            # an empty string is a detached HEAD, which git still tracks.
+            backend=backend, project=project, git_on=branch is not None,
+        )
         acc.record_task(task_stem=running.stem, outcome=outcome, result=result)
 
         if outcome == "completed":
@@ -841,6 +958,14 @@ def _run_loop(
                 _answer_held_interactively(q, running.stem, questions)
                 continue  # re-picked next loop in a fresh session
             return _print_held_instructions(q, running.stem)
+        if outcome == "interrupted":
+            sig.held()  # amber: needs attention, but nothing is broken
+            halt = _handle_interruption(
+                args, q, project, running.stem, result, failure, out=out
+            )
+            if halt is not None:
+                return halt
+            continue  # recovered into pending/ — the loop picks it straight up
         # failed
         sig.failed(completed)
         return _print_failed(q, running.stem, result)
@@ -860,29 +985,68 @@ def _build_prompt(q: Queue, task: Task) -> str:
 
 
 def _route(
-    q: Queue, running: Task, result: RunResult
-) -> tuple[str, list[Question] | None, list[FollowUp] | None]:
+    q: Queue,
+    running: Task,
+    result: RunResult,
+    *,
+    backend: AgentBackend | None = None,
+    project: Path | None = None,
+    git_on: bool = False,
+) -> tuple[str, list[Question] | None, list[FollowUp] | None, Failure | None]:
     """Classify a finished run, perform the queue move, and return parsed
-    questions (held) or discovered follow-ups (completed) for the caller."""
+    questions (held), discovered follow-ups (completed), or the failure
+    classification (failed/interrupted) for the caller.
+
+    A non-success splits two ways. The agent finishing its turn and breaking
+    the protocol is a defect a human should see, so it goes to `failed/` as
+    before. Something *external* cutting the turn short is recoverable, so it
+    goes to `interrupted/` with a sidecar recording the tree it left behind —
+    the snapshot is taken here, at the moment of interruption, while the
+    evidence is still fresh. No commit happens yet; that is recovery's job.
+    """
     if not result.succeeded:
+        failure = (
+            backend.classify_failure(result) if backend is not None
+            else Failure(kind=FailureKind.DEFECT)
+        )
+        if failure.interrupted:
+            snap = (
+                git.snapshot(project, ignore_within=q.root)
+                if git_on and project is not None else None
+            )
+            record = recovery.load(_read_sidecar(q, running.stem), stem=running.stem)
+            record.add(recovery.attempt_from(result=result, failure=failure, snap=snap))
+            q.mark_interrupted(running, recovery.render_sidecar(record))
+            return "interrupted", None, None, failure
         q.mark_failed(running)
-        return "failed", None, None
+        return "failed", None, None, failure
 
     parsed = parse(result.final_text)
     if parsed.outcome is Outcome.COMPLETED:
         q.write_carry(running.stem, unwrap_fence(parsed.body))
         q.mark_done(running)
         follow_ups = parse_follow_ups(parsed.follow_up) if parsed.follow_up else None
-        return "completed", None, follow_ups
+        return "completed", None, follow_ups, None
     if parsed.outcome is Outcome.HELD:
         questions = parse_questions(parsed.body)
         rendered = render_questions(questions) if questions else parsed.body
         q.mark_held(running, rendered, raw=parsed.body)
-        return "held", questions, None
+        return "held", questions, None, None
 
-    # Unparseable — agent finished cleanly but did not emit the protocol.
+    # Unparseable — agent finished cleanly but did not emit the protocol. That
+    # is a defect, not an interruption: the turn ended on the agent's own terms.
     q.mark_failed(running)
-    return "failed", None, None
+    return "failed", None, None, Failure(
+        kind=FailureKind.DEFECT,
+        reason="no_sentinel",
+        detail=parsed.body or "no sentinel block in the agent's output",
+    )
+
+
+def _read_sidecar(q: Queue, stem: str) -> str:
+    """Existing recovery sidecar text for `stem`, or "" on the first interruption."""
+    path = q.recovery_path(stem)
+    return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
 # ----------------------------------------------------------------------
@@ -915,11 +1079,19 @@ def _setup_branch(
         return None, None
 
     clean, dirty = git.is_clean(project, ignore_within=queue_root)
-    if not clean:
+    if not clean and not getattr(args, "allow_dirty", False):
         print("odin: refusing to start — the working tree is not clean:", file=sys.stderr)
         print(_indent(dirty), file=sys.stderr)
         print("Commit or stash your changes first.", file=sys.stderr)
+        print(
+            "(If this is work an interrupted run left behind, `odin recover` "
+            "checkpoints it for you.)",
+            file=sys.stderr,
+        )
         return None, 2
+    if not clean:
+        print("odin: warning — starting with a dirty working tree (--allow-dirty).",
+              file=sys.stderr)
 
     try:
         branch = _resolve_branch(args, project)
@@ -1024,6 +1196,320 @@ def _ask_freeform(q: Queue, stem: str) -> str:
     return "\n".join(lines) or "(no answer provided)"
 
 
+def _stdout(out: "TextIO | None") -> TextIO:
+    """Resolve a defaulted output sink at call time, never at import time.
+
+    `out=sys.stdout` as a default argument binds the stream that existed when
+    the module was imported, which silently bypasses any later redirection
+    (pytest capture, a caller's StringIO). Same pattern as `runner.run_agent`.
+    """
+    return sys.stdout if out is None else out
+
+
+# ----------------------------------------------------------------------
+# interruption recovery
+# ----------------------------------------------------------------------
+# Two entry points share one implementation: a task interrupted mid-run (the
+# loop offers to recover on the spot) and `odin recover` / `odin run` startup
+# picking up an interruption from an earlier session. Both converge on
+# `_perform_recovery`, exactly as the two held paths converge on resume_held.
+
+def _handle_interruption(
+    args: argparse.Namespace,
+    q: Queue,
+    project: Path,
+    stem: str,
+    result: RunResult,
+    failure: Failure | None,
+    *,
+    out: TextIO | None = None,
+) -> int | None:
+    """React to a task that was cut off mid-run. None = recovered, keep going.
+
+    Returns an exit code to halt with, or None to continue the queue. Halting
+    always leaves the queue in a runnable state — the task is either recovered
+    into `pending/` or sitting in `interrupted/` with instructions.
+    """
+    out = _stdout(out)
+    _print_interrupted(q, stem, failure, out=out)
+
+    if not _may_recover(args):
+        _print_recover_instructions(q, stem, failure, out=out)
+        return 12
+
+    task = _perform_recovery(
+        q, project, stem,
+        wip_commit=not args.no_wip_commit,
+        brief_on=not getattr(args, "no_brief", False),
+        verify_cmd=_resolve_verify_cmd(args),
+        git_on=not getattr(args, "no_git", False),
+        out=out,
+    )
+    if task is None:
+        return 12
+
+    resets_at = getattr(failure, "resets_at", None)
+    if resets_at is not None and _should_wait(args, resets_at, out=out):
+        if wait.sleep_until(resets_at, out=out, max_minutes=_max_wait(args)):
+            return None
+        return 12
+    if getattr(failure, "reason", "") == "usage_limit":
+        # No wait was taken and the limit is still in force — continuing now
+        # would just burn another attempt and score it as no-progress.
+        print(style.dim(
+            f"   {stem} is recovered and queued; run `odin run` again once the "
+            "limit lifts."
+        ), file=out)
+        return 12
+    return None
+
+
+def _may_recover(args: argparse.Namespace) -> bool:
+    """Is Odin allowed to recover here — flag, or an answered prompt?
+
+    Note that `--yes` deliberately does NOT count. It means "skip the
+    platform/model confirmation", and a script that passes it is not thereby
+    consenting to Odin writing a commit. Only `--recover` authorises that.
+    """
+    if getattr(args, "no_auto_recover", False):
+        return False
+    if getattr(args, "recover", False):
+        return True
+    if not sys.stdin.isatty():
+        return False  # never commit on a user's behalf in an unattended run
+    return ask_continue("Recover and continue?", default=True)
+
+
+def _should_wait(
+    args: argparse.Namespace, resets_at, *, out: TextIO | None = None
+) -> bool:
+    out = _stdout(out)
+    if wait.exceeds_cap(resets_at, _max_wait(args)):
+        print(style.dim(
+            f"   reset is beyond the {_max_wait(args)}-minute cap — not waiting."
+        ), file=out)
+        return False
+    if getattr(args, "wait_for_reset", False):
+        return True
+    if not sys.stdin.isatty():
+        return False
+    delta = wait.human_delta(wait.seconds_until(resets_at))
+    return ask_continue(f"Wait {delta} and continue automatically?", default=False)
+
+
+def _max_wait(args: argparse.Namespace) -> int:
+    return getattr(args, "max_wait", None) or wait.DEFAULT_MAX_WAIT_MINUTES
+
+
+def _resolve_verify_cmd(args: argparse.Namespace) -> str | None:
+    return getattr(args, "verify_cmd", None) or config.recovery_verify_command()
+
+
+def _perform_recovery(
+    q: Queue,
+    project: Path,
+    stem: str,
+    *,
+    wip_commit: bool = True,
+    brief_on: bool = True,
+    verify_cmd: str | None = None,
+    force: bool = False,
+    dry_run: bool = False,
+    git_on: bool = True,
+    out: TextIO | None = None,
+) -> Task | None:
+    """Commit the partial work, merge the brief, and requeue `stem`.
+
+    Returns the requeued Task, or None if recovery did not happen (blocked by
+    the no-progress breaker, refused by the secret guard, a git failure, or
+    `dry_run`). The order matters: commit first, so that if anything later goes
+    wrong — or the machine dies during a reset wait — the work is already safe.
+    """
+    out = _stdout(out)
+    record = recovery.load(_read_sidecar(q, stem), stem=stem)
+    if record.blocked and not force:
+        print(style.err(
+            f"✗ {stem} · the last two attempts made no progress (no turns, no "
+            "file changes)."
+        ), file=out)
+        print("  That does not look like a usage limit. Check the agent binary "
+              "and auth.", file=out)
+        print(f"  Recover anyway with: odin recover {stem} --force", file=out)
+        return None
+
+    git_on = git_on and git.is_repo(project)
+    snap = git.snapshot(project, ignore_within=q.root) if git_on else None
+    attempt = record.latest
+
+    if dry_run:
+        _print_recovery_plan(q, stem, snap, record, wip_commit, brief_on,
+                             verify_cmd, out=out)
+        return None
+
+    sha = None
+    if wip_commit and snap is not None and snap.dirty:
+        try:
+            committed = git.commit_wip(
+                project, stem=stem,
+                reason=(attempt.reason if attempt else None),
+                ignore_within=q.root, snap=snap,
+            )
+        except git.SecretGuardError as e:
+            print(style.err(f"✗ {e}"), file=out)
+            print("  Nothing was committed and the tree is untouched. Deal with "
+                  "those files, then recover again.", file=out)
+            return None
+        except git.GitError as e:
+            print(style.err(f"✗ could not commit the interrupted work: {e}"), file=out)
+            print("  The tree is untouched. Commit manually, then recover again.",
+                  file=out)
+            return None
+        if committed is not None:
+            sha, _ = committed
+            print(f"  → commit  {sha}  wip(odin): interrupted attempt at {stem}",
+                  file=out)
+
+    # Fold what recovery just learned back into the record: the tree as it
+    # actually stood, and the checkpoint commit the brief will point the next
+    # agent at.
+    if attempt is not None and snap is not None:
+        groups = snap.by_kind()
+        attempt.wip_commit = sha
+        attempt.files = snap.files
+        attempt.insertions = snap.insertions
+        attempt.deletions = snap.deletions
+        attempt.new, attempt.modified, attempt.deleted = (
+            groups["new"], groups["modified"], groups["deleted"],
+        )
+        if not attempt.head_before:
+            attempt.head_before, attempt.head_subject = snap.head, snap.head_subject
+
+    verify_output = _run_verify(project, verify_cmd, out=out) if verify_cmd else ""
+    brief = (
+        recovery.build_brief(record, verify_output=verify_output) if brief_on
+        else recovery.MINIMAL_BRIEF
+    )
+    q.recovery_path(stem).write_text(recovery.render_sidecar(record), encoding="utf-8")
+    task = q.recover_interrupted(stem, brief)
+    print(f"  → move    interrupted/{stem}.md → pending/", file=out)
+    print("  → brief   resumption context merged into task body", file=out)
+    return task
+
+
+def _run_verify(project: Path, cmd: str, *, out: TextIO | None = None) -> str:
+    """Run the configured verification command; its output feeds the brief.
+
+    Best-effort and never fatal — a build that fails is exactly the state the
+    brief is meant to describe, and a command that cannot run at all should not
+    block recovery.
+    """
+    out = _stdout(out)
+    print(style.dim(f"  → verify  {cmd}"), file=out)
+    try:
+        proc = subprocess.run(
+            cmd, shell=True, cwd=str(project), capture_output=True,
+            text=True, timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"$ {cmd}\n(could not run: {e})"
+    body = (proc.stdout + proc.stderr).strip()
+    if len(body) > 4000:
+        body = body[:4000] + "\n… (truncated)"
+    return f"$ {cmd}\n(exit {proc.returncode})\n{body}" if body else (
+        f"$ {cmd}\n(exit {proc.returncode}, no output)"
+    )
+
+
+def _adopt_stranded(q: Queue, project: Path, task: Task, *, out: TextIO) -> str:
+    """Move a file stranded in running/ into interrupted/ so it can be recovered.
+
+    Odin's own death leaves no failure path to run, so the snapshot is taken now
+    and the record says plainly that how far the attempt got is unknown.
+    """
+    out = _stdout(out)
+    snap = git.snapshot(project, ignore_within=q.root) if git.is_repo(project) else None
+    record = recovery.load(_read_sidecar(q, task.stem), stem=task.stem)
+    record.add(recovery.attempt_from(
+        failure=Failure(
+            kind=FailureKind.INTERRUPTED, confidence="probable", reason="process_died",
+            detail="the odin process did not exit cleanly; the task was left in running/",
+        ),
+        snap=snap, reason="process_died",
+    ))
+    q.adopt_stranded(task, recovery.render_sidecar(record))
+    print(style.dim(
+        f"   {task.stem} was left in running/ by an odin process that did not "
+        "exit cleanly"
+    ), file=out)
+    return task.stem
+
+
+def _startup_recovery(
+    args: argparse.Namespace, project: Path, q: Queue, *, out: TextIO | None = None
+) -> int | None:
+    """Deal with leftovers from a previous session before the loop starts.
+
+    Returns an exit code to stop with, or None to proceed. Muscle memory is
+    `odin run`, so making that the primary door matters more than the purity of
+    a separate verb — but it never commits without consent.
+    """
+    out = _stdout(out)
+    for task in q.stranded_running():
+        _adopt_stranded(q, project, task, out=out)
+
+    pending = q.interrupted()
+    if not pending:
+        return None
+    if len(pending) > 1:
+        print(style.warn(
+            f"⏸ {len(pending)} interrupted tasks are waiting: "
+            + ", ".join(t.stem for t in pending)
+        ), file=out)
+        print("Recover them one at a time: odin recover <stem>", file=out)
+        return 12
+
+    stem = pending[0].stem
+    record = recovery.load(_read_sidecar(q, stem), stem=stem)
+    failure = _failure_from_record(record)
+    _print_interrupted(q, stem, failure, out=out)
+
+    if not _may_recover(args):
+        _print_recover_instructions(q, stem, failure, out=out)
+        return 12
+    task = _perform_recovery(
+        q, project, stem,
+        wip_commit=not args.no_wip_commit,
+        brief_on=not getattr(args, "no_brief", False),
+        verify_cmd=_resolve_verify_cmd(args),
+        git_on=not getattr(args, "no_git", False),
+        out=out,
+    )
+    if task is None:
+        return 12
+    resets_at = getattr(failure, "resets_at", None)
+    if resets_at is not None and _should_wait(args, resets_at, out=out):
+        if not wait.sleep_until(resets_at, out=out, max_minutes=_max_wait(args)):
+            return 12
+    return None
+
+
+def _failure_from_record(record: recovery.Record) -> Failure | None:
+    """Rebuild a Failure from a stored attempt, for printing and wait offers."""
+    a = record.latest
+    if a is None:
+        return None
+    resets = None
+    if a.resets_at:
+        try:
+            resets = datetime.fromisoformat(a.resets_at)
+        except ValueError:
+            resets = None
+    return Failure(
+        kind=FailureKind.INTERRUPTED, confidence=a.confidence, reason=a.reason,
+        detail=a.detail, resets_at=resets,
+    )
+
+
 # ----------------------------------------------------------------------
 # discovered follow-up work
 # ----------------------------------------------------------------------
@@ -1096,6 +1582,89 @@ def _print_held_instructions(q: Queue, stem: str) -> int:
     return 10  # distinct non-zero exit so CI/loops can distinguish
 
 
+def _print_interrupted(
+    q: Queue, stem: str, failure: Failure | None, *, out: TextIO | None = None
+) -> None:
+    """The banner for a task that was cut off rather than defeated."""
+    out = _stdout(out)
+    reason = {
+        "usage_limit": "usage limit",
+        "process_died": "odin process died",
+        "unknown": "cause unknown",
+    }.get(getattr(failure, "reason", ""), "cause unknown")
+    print(file=out)
+    print(style.warn(f"{style.GLYPH_HELD} {stem} · interrupted · {reason}"), file=out)
+
+    resets_at = getattr(failure, "resets_at", None)
+    if resets_at is not None:
+        print(f"   resets at {wait.format_target(resets_at)}", file=out)
+    detail = (getattr(failure, "detail", "") or "").strip()
+    if detail:
+        print(style.dim(f"   {detail}"), file=out)
+
+    record = recovery.load(_read_sidecar(q, stem), stem=stem)
+    a = record.latest
+    if a is not None and a.files:
+        print(f"   {a.files} file{'s' if a.files != 1 else ''} changed, "
+              f"+{a.insertions}/-{a.deletions} uncommitted", file=out)
+    if a is not None and len(record.attempts) > 1:
+        print(style.dim(f"   attempt {len(record.attempts)} of this task"), file=out)
+
+
+def _print_recover_instructions(
+    q: Queue, stem: str, failure: Failure | None, *, out: TextIO | None = None
+) -> None:
+    """What to type when Odin won't recover on its own (no TTY, or declined)."""
+    out = _stdout(out)
+    if not sys.stdin.isatty():
+        print("\nNot a TTY — halting (exit 12).", file=out)
+    print(f"To recover: odin recover {stem} {_abbrev_home(q.root)}", file=out)
+    if getattr(failure, "resets_at", None) is not None:
+        print("Or run unattended: odin run --recover --wait-for-reset", file=out)
+    else:
+        print("Or run unattended: odin run --recover", file=out)
+
+
+def _print_recovery_plan(
+    q: Queue,
+    stem: str,
+    snap,
+    record: recovery.Record,
+    wip_commit: bool,
+    brief_on: bool,
+    verify_cmd: str | None,
+    *,
+    out: TextIO | None = None,
+) -> None:
+    """`--dry-run`: everything recovery would do, and the brief verbatim."""
+    out = _stdout(out)
+    print(file=out)
+    if snap is not None and snap.dirty:
+        for xy, path in snap.entries[:10]:
+            print(style.dim(f"   {xy} {path}"), file=out)
+        if len(snap.entries) > 10:
+            print(style.dim(f"   … ({len(snap.entries) - 10} more)"), file=out)
+        print(f"   {snap.diffstat()}", file=out)
+        print(file=out)
+        if wip_commit:
+            print(f"  → commit  wip(odin): interrupted attempt at {stem}", file=out)
+        else:
+            print("  → leave   working tree untouched (--no-wip-commit)", file=out)
+    else:
+        print("   working tree is clean — nothing to commit", file=out)
+    if verify_cmd:
+        print(f"  → verify  {verify_cmd}", file=out)
+    print(f"  → move    interrupted/{stem}.md → pending/", file=out)
+    print("  → brief   " + ("full resumption brief" if brief_on
+                            else "one-line retry note (--no-brief)"), file=out)
+    brief = recovery.build_brief(record) if brief_on else recovery.MINIMAL_BRIEF
+    print(file=out)
+    print(style.dim("--- brief that would be merged " + "-" * 34), file=out)
+    print(brief, file=out)
+    print(style.dim("-" * 64), file=out)
+    print("\n[dry-run] nothing was written.", file=out)
+
+
 def _print_failed(q: Queue, stem: str, result: RunResult) -> int:
     print()
     print(style.err(
@@ -1122,9 +1691,11 @@ def _print_failed(q: Queue, stem: str, result: RunResult) -> int:
 
 # Per-state next-action hint (keyed by state name). Built per-task.
 _STATE_HINT = {
-    "held":    lambda t: f"odin resume {t.stem}",
-    "backlog": lambda t: "promote: move to pending/",
-    "failed":  lambda t: "retry: move to pending/",
+    "held":        lambda t: f"odin resume {t.stem}",
+    "interrupted": lambda t: f"odin recover {t.stem}",
+    "running":     lambda t: f"stranded: odin recover {t.stem}",
+    "backlog":     lambda t: "promote: move to pending/",
+    "failed":      lambda t: "retry: move to pending/",
 }
 
 
@@ -1145,11 +1716,14 @@ def _summarize_counts(counts: dict[str, int]) -> tuple[str, list[str]]:
     3-of-10. `total` is the planned lifecycle (pending+running+held+done+failed);
     backlog is discovered-later work, shown separately as '+N backlog'.
     """
-    total = sum(counts[s] for s in ("pending", "running", "held", "done", "failed"))
+    total = sum(
+        counts[s]
+        for s in ("pending", "running", "held", "interrupted", "done", "failed")
+    )
     if total == 0 and counts["backlog"] == 0:
         return "(empty)", []
     parts = [f"{counts['done']}/{total} done"]
-    for state in ("pending", "running", "held", "failed"):
+    for state in ("pending", "running", "held", "interrupted", "failed"):
         if counts[state]:
             parts.append(f"{counts[state]} {state}")
     if counts["backlog"]:
@@ -1157,6 +1731,8 @@ def _summarize_counts(counts: dict[str, int]) -> tuple[str, list[str]]:
     flags = []
     if counts["held"]:
         flags.append("needs input")
+    if counts["interrupted"] or counts["running"]:
+        flags.append("recoverable")
     if counts["failed"]:
         flags.append("has failures")
     return ", ".join(parts), flags
@@ -1201,12 +1777,13 @@ def _print_queue_detail(q: Queue) -> None:
         ("pending", q.pending()),
         ("running", q.running()),
         ("held",    q.held()),
+        ("interrupted", q.interrupted()),
         ("done",    q.done()),
         ("failed",  q.failed()),
         ("backlog", q.backlog()),
     )
     for name, tasks in sections:
-        print(f"  {name:8s} ({len(tasks)})")
+        print(f"  {name:11s} ({len(tasks)})")
         hint = _STATE_HINT.get(name)
         for t in tasks:
             line = f"    - {t.name}  ({_age(t.path)})"
@@ -1302,6 +1879,115 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     print(f"odin: {args.stem} moved back to pending/ ({moved.path}).")
     print("Run `odin run` to continue the queue.")
     return 0
+
+
+# ----------------------------------------------------------------------
+# recover
+# ----------------------------------------------------------------------
+
+def _cmd_recover(args: argparse.Namespace) -> int:
+    _disambiguate_recover_args(args)
+    args.queue = _resolve_queue_arg(args.queue)
+    project = (args.project or Path.cwd()).resolve()
+    if not project.is_dir():
+        print(f"odin: --project does not exist: {project}", file=sys.stderr)
+        return 2
+
+    q = Queue(args.queue, create=False)
+    if _is_container(q):
+        subs = q.subqueues()
+        print(
+            f"odin: {q.root} holds sub-queues, not tasks directly. Point recover "
+            f"at one, e.g. `odin recover {Path(args.queue) / subs[0]}`."
+            if subs else f"odin: {q.root} is not a queue.",
+            file=sys.stderr,
+        )
+        return 2
+    q.ensure_dirs()
+
+    # A file stranded in running/ is the same situation with a different cause,
+    # so adopt it before looking for something to recover.
+    for task in q.stranded_running():
+        _adopt_stranded(q, project, task, out=sys.stdout)
+
+    stem = args.stem
+    if stem is None:
+        candidates = q.interrupted()
+        if not candidates:
+            print("odin: nothing to recover — no interrupted tasks.")
+            return 0
+        if len(candidates) > 1:
+            print("odin: several interrupted tasks; name one:", file=sys.stderr)
+            for t in candidates:
+                print(f"  - {t.stem}", file=sys.stderr)
+            return 2
+        stem = candidates[0].stem
+    stem = stem.removesuffix(".md")
+
+    if not (q.root / "interrupted" / f"{stem}.md").exists():
+        print(f"odin: no interrupted task '{stem}' in {q.root}.", file=sys.stderr)
+        return 2
+
+    record = recovery.load(_read_sidecar(q, stem), stem=stem)
+    failure = _failure_from_record(record)
+    _print_interrupted(q, stem, failure)
+
+    task = _perform_recovery(
+        q, project, stem,
+        wip_commit=not args.no_wip_commit,
+        brief_on=not args.no_brief,
+        verify_cmd=_resolve_verify_cmd(args),
+        force=args.force,
+        dry_run=args.dry_run,
+    )
+    if args.dry_run:
+        return 0
+    if task is None:
+        return 12
+
+    resets_at = getattr(failure, "resets_at", None)
+    if resets_at is not None and not args.yes and _should_wait(args, resets_at):
+        if not wait.sleep_until(resets_at, max_minutes=_max_wait(args)):
+            return 12
+        return _continue_after_recovery(q, args)
+
+    if args.yes or not sys.stdin.isatty():
+        print(f"\nodin: {stem} is back in pending/. Run `odin run` to continue.")
+        return 0
+    if ask_continue("Continue the queue now?", default=True):
+        return _continue_after_recovery(q, args)
+    print(f"odin: {stem} is back in pending/. Run `odin run` when ready.")
+    return 0
+
+
+def _disambiguate_recover_args(args: argparse.Namespace) -> None:
+    """Let `odin recover <queue>` mean the queue, not a task stem.
+
+    Both positionals are optional and the stem comes first, so `odin recover
+    go-rewrite` would otherwise be read as a task named "go-rewrite" in the
+    default queue. Naming the queue is at least as common as naming the task —
+    there is usually only one interrupted task — so when the first positional
+    resolves to a directory and no queue was given, it *is* the queue.
+    """
+    if args.stem is None or args.queue != Path("./queue"):
+        return
+    candidate = _resolve_queue_arg(Path(args.stem))
+    if candidate.is_dir():
+        args.queue, args.stem = candidate, None
+
+
+def _continue_after_recovery(q: Queue, args: argparse.Namespace) -> int:
+    """Hand off from `odin recover` into a real run of the same queue.
+
+    Recovery deliberately does not know how to run tasks — it re-enters the
+    normal `odin run` path with the same queue and project so every flag,
+    confirmation and metric behaves identically to typing it by hand.
+    """
+    print()
+    argv = ["run", str(q.root)]
+    if args.project:
+        argv += ["--project", str(args.project)]
+    return main(argv)
 
 
 # ----------------------------------------------------------------------

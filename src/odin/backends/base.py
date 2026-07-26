@@ -23,11 +23,63 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
 if TYPE_CHECKING:  # avoid an import cycle at runtime — runner imports nothing here
     from odin.runner import RunResult
+
+
+class FailureKind(str, Enum):
+    """Why a run did not succeed — the routing decision.
+
+    INTERRUPTED: something external stopped the agent mid-turn (usage limit,
+    hard kill). The work is probably fine as far as it got, so the task is
+    recoverable — see `docs/interruption-recovery-proposal.md`.
+
+    DEFECT: the agent finished its turn on its own terms and produced something
+    Odin could not use (no sentinel block, malformed output). A human should
+    look at it.
+    """
+
+    INTERRUPTED = "interrupted"
+    DEFECT = "defect"
+
+
+@dataclass(frozen=True)
+class Failure:
+    """A classified non-success, with whatever detail the backend could recover.
+
+    `confidence` is "confirmed" when a recognised provider message named the
+    cause, "probable" when only the structural rule fired. `reason` is one of
+    "usage_limit" / "process_died" / "unknown". `resets_at`, when present, is
+    when the provider said the limit lifts — used to offer a wait.
+    """
+
+    kind: FailureKind
+    confidence: str = "probable"
+    reason: str = "unknown"
+    detail: str = ""
+    resets_at: datetime | None = None
+
+    @property
+    def interrupted(self) -> bool:
+        return self.kind is FailureKind.INTERRUPTED
+
+
+def ended_on_agents_terms(result: "RunResult") -> bool:
+    """Did the agent's turn end because the agent decided it was done?
+
+    The platform-agnostic half of interruption detection, and the reason
+    classification needs no message pattern-matching to be correct: a clean exit
+    with a non-error terminal event means the agent stopped by choice, and
+    anything else means something external stopped it. Backends layer
+    provider-specific *enrichment* (which limit, when it resets) on top, but
+    routing never depends on that enrichment succeeding.
+    """
+    return result.exit_code == 0 and result.error is None and bool(result.final_text)
 
 
 # A backend's stream handler may return a dict of fields captured from an event
@@ -158,3 +210,14 @@ class AgentBackend(ABC):
         re-derives it.
         """
         raise NotImplementedError
+
+    def classify_failure(self, result: "RunResult") -> Failure:
+        """Why did this non-successful run fail? Called only when not succeeded.
+
+        The default is DEFECT — today's behaviour, where every failure routes to
+        `failed/` for a human. A backend opts into interruption recovery by
+        overriding this; `ended_on_agents_terms` gives the platform-agnostic
+        structural rule, so an implementation is usually a few lines plus
+        whatever provider-message enrichment the CLI makes available.
+        """
+        return Failure(kind=FailureKind.DEFECT, confidence="probable", reason="unknown")

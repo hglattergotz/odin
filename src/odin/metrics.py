@@ -189,6 +189,7 @@ _STOP = {
     2: "setup_error",
     10: "held",
     11: "urgent_halt",
+    12: "interrupted",
 }
 
 
@@ -230,6 +231,7 @@ class RunAccumulator:
         self.completed = 0
         self.failed = 0
         self.held = 0
+        self.interrupted = 0
         self.cost_total = 0.0
         self._any_cost = False  # True once any task yields a numeric cost_usd
         self.tokens_total = {k: 0 for k in _TOKEN_KEYS}
@@ -240,6 +242,12 @@ class RunAccumulator:
             self.completed += 1
         elif outcome == "held":
             self.held += 1
+        elif outcome == "interrupted":
+            # Counted apart from failures on purpose: an interruption says
+            # nothing about the quality of the work, and folding it into the
+            # failure rate would make a heavily rate-limited week look like a
+            # broken one.
+            self.interrupted += 1
         else:
             self.failed += 1
 
@@ -272,6 +280,10 @@ class RunAccumulator:
                 "outcome": outcome,
                 "stop_reason": getattr(result, "stop_reason", None),
                 "error": getattr(result, "error", None),
+                # Third classification signal alongside stop_reason/error —
+                # without it the log can't answer "was this an interruption?"
+                # after the fact.
+                "exit_code": getattr(result, "exit_code", None),
                 "wall_ms": getattr(result, "wall_ms", None),
                 "agent_duration_ms": getattr(result, "duration_ms", None),
                 "agent_api_ms": getattr(result, "api_ms", None),
@@ -289,7 +301,7 @@ class RunAccumulator:
         self._finished = True
         if not self.enabled:
             return
-        tasks_total = self.completed + self.failed + self.held
+        tasks_total = self.completed + self.failed + self.held + self.interrupted
         if tasks_total == 0:
             # Nothing ran (empty queue, setup error) — don't log a hollow run.
             return
@@ -309,6 +321,7 @@ class RunAccumulator:
                 "tasks_completed": self.completed,
                 "tasks_failed": self.failed,
                 "tasks_held": self.held,
+                "tasks_interrupted": self.interrupted,
                 "tasks_total": tasks_total,
                 "wall_ms": int((time.monotonic() - self._mono) * 1000),
                 "tokens_total": dict(self.tokens_total),
@@ -405,7 +418,7 @@ def aggregate(
         tasks = [t for t in tasks if project_filter in str(t.get("project", ""))]
         runs = [r for r in runs if project_filter in str(r.get("project", ""))]
 
-    outcomes = {"completed": 0, "held": 0, "failed": 0}
+    outcomes = {"completed": 0, "held": 0, "interrupted": 0, "failed": 0}
     tokens_total = _empty_tokens()
     cost_total = 0.0
     any_cost = False
@@ -602,7 +615,9 @@ def render_text(agg: dict) -> str:
         f"peak concurrent runs: {agg['peak_concurrency']}"
         + (f" (at {peak_at})" if peak_at else ""),
         f"  outcomes: {agg['outcomes']['completed']} completed, "
-        f"{agg['outcomes']['held']} held, {agg['outcomes']['failed']} failed",
+        f"{agg['outcomes']['held']} held, "
+        f"{agg['outcomes'].get('interrupted', 0)} interrupted, "
+        f"{agg['outcomes']['failed']} failed",
         f"  cost: {_fmt_cost(agg['cost_total'])}    "
         f"tokens: {_tokens_line(agg['tokens_total'])}",
         f"  task time: mean {_fmt_ms(tw['mean'])}, median {_fmt_ms(tw['median'])}, "

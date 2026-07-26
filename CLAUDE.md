@@ -54,13 +54,15 @@ odin/
 │   ├── config.py        # ~/.odin/config.toml load/save + resolution
 │   ├── protocol.py      # sentinel markers + JSON question parsing
 │   ├── contract.py      # the protocol Odin injects via system prompt
-│   ├── git.py           # startup-only git wrapper (clean check + branch)
+│   ├── git.py           # git wrapper: clean check + branch, and commit_wip
 │   ├── prompts.py       # interactive terminal Q&A + branch selection
 │   ├── demo.py          # `odin demo` scaffolder (test fixture)
 │   ├── _demo_files.py   # generated: embedded otest fixture content
 │   ├── guide.py         # `odin guide` authoring manual (self-discovery)
 │   ├── lint.py          # startup instruction-file git-conflict warnings
 │   ├── metrics.py       # central JSONL run/task metrics + report renderers
+│   ├── recovery.py      # interruption sidecar + resumption brief
+│   ├── wait.py          # sleeping until a provider limit window reopens
 │   ├── term.py          # best-effort OSC terminal signaling (title/color/notify)
 │   └── completed.py     # COMPLETED.md mailbox (Odin→agent handoff)
 ├── examples/
@@ -82,14 +84,36 @@ odin run    [QUEUE_DIR] [--project PATH] [--platform NAME] [--model MODEL]
             [--branch NAME] [--base NAME] [--no-git] [--no-metrics] [--no-title]
             [--notify] [--tab-title PREFIX] [--tab-color HEX] [--no-color]
             [--completed-file] [--dry-run]
+            [--recover] [--no-auto-recover] [--wait-for-reset] [--max-wait MIN]
+            [--no-wip-commit] [--allow-dirty] [--verify-cmd CMD]
 odin status [QUEUE_DIR]
 odin resume HELD_TASK [QUEUE_DIR]
+odin recover [STEM] [QUEUE_DIR] [--project PATH] [--dry-run] [--no-wip-commit]
+            [--no-brief] [--verify-cmd CMD] [--wait-for-reset] [--max-wait MIN]
+            [--force] [--yes]
 odin demo   DIR [--force]
 odin guide  [TOPIC]
 odin archive [QUEUE_DIR]
 odin metrics [--html [PATH]] [--project SUBSTR] [--file PATH]
 odin config [show|get KEY|set KEY VALUE]
 ```
+
+`odin recover` puts a task that was cut off **mid-work** back to work: it
+commits whatever partial work is in the tree as a single WIP checkpoint (so the
+tree is clean and the clean-tree check passes), merges a **resumption brief**
+into the task body so the next agent knows it is continuing rather than
+starting fresh, and moves the file back to `pending/`. Distinct from `odin
+resume`, which merges a *held* task's questions with the user's answers. Both
+converge on the same shape — a sidecar next to the body, merged in on the way
+out — but they answer different questions ("what did you decide?" vs. "what did
+your predecessor already do?"). Details and rationale:
+[`docs/interruption-recovery-proposal.md`](docs/interruption-recovery-proposal.md).
+
+`odin run` is the primary door: on a TTY it detects an interrupted task (or one
+stranded in `running/` by an odin process that died) at startup and offers to
+recover it. Non-interactive runs **halt at exit 12** and print the command
+instead — `-y` skips the platform confirmation and is deliberately *not* consent
+to write a commit; only `--recover` is.
 
 `odin archive` operates on a **container** of named sub-queues: it moves every
 *fully finished* sub-queue (nothing in pending/running/held/failed/backlog and
@@ -265,11 +289,22 @@ queue/
 ├── pending/    # NNN-slug.md       — waiting, picked in lexicographic order
 ├── running/    # the in-flight file lives here briefly
 ├── done/       # completed successfully
-├── failed/     # non-zero exit, stop_reason != end_turn, or unparseable output
+├── failed/     # the agent finished its turn but broke the protocol
 ├── held/       # blocked on questions; resume with `odin resume`
+├── interrupted/# cut off mid-work; recover with `odin recover`
+│               #   NNN-slug.md + NNN-slug.recovery.md (evidence + brief)
 ├── carry/      # NNN-slug.next-context.md — emitted by the prior task
 └── backlog/    # non-urgent follow-up tasks an agent discovered mid-run
 ```
+
+`failed/` and `interrupted/` are kept apart on purpose. A **defect** — the agent
+ended its turn on its own terms and emitted no sentinel — needs a human.
+An **interruption** — a provider usage limit, a hard kill, Odin's own process
+dying — says nothing about the quality of the work and is recoverable. Folding
+them together is what made the common case (interruption) cost a manual cleanup
+in another tool. Interrupted work blocks `odin archive`, and a recovered task
+stays distinguishable afterwards: its sidecar survives in `interrupted/` with
+the full attempt log.
 
 A **container** (a dir of named sub-queues, not a queue itself) additionally
 grows `archive/<name>/` — whole finished sub-queues `odin archive` moved out of
@@ -308,6 +343,46 @@ items are filed in `backlog/` and called out when the queue drains (exit 0);
 `urgent` items are inserted into `pending/` to run next, with the user asked
 to continue or stop (unattended → halt, exit 11). See `protocol.parse` /
 `parse_follow_ups` and `_handle_follow_ups` in `cli.py`.
+
+## Interruption recovery
+
+A task can stop for a reason that says nothing about the work: the agent CLI
+hits a provider usage limit mid-task, the process is killed, or Odin itself
+dies. `backend.classify_failure` splits these from real defects **structurally**
+— did the turn end on the agent's own terms? — so recognising a provider's
+exact wording is never required for correct routing. Recognising it only
+*enriches*: the reason label and the reset time. An unrecognised limit notice
+still routes to `interrupted/`; a test pins that guarantee down.
+
+The flow, all of it in `recovery.py` + `cli.py`'s recovery section:
+
+1. **Interruption.** `_route` snapshots the working tree (`git.snapshot`, read
+   only) and writes `interrupted/NNN-slug.recovery.md` — reason, confidence,
+   reset time, the attempt log, and the dying agent's last words. No commit yet.
+2. **Recovery** (`odin recover`, or the offer at `odin run` startup). Commits
+   the partial work, then merges the brief and moves the body to `pending/`.
+   Commit-first is deliberate: if the machine dies during a reset wait, the work
+   is already safe.
+3. **Resumption.** The brief tells the next agent it is continuing — which
+   commit holds its predecessor's work, which commit was the last real
+   milestone, what the predecessor last said, and to reconcile before writing.
+   Merged between the carry-context and the task body, delimited by
+   `<!-- odin:resumption-brief -->` so a re-recovery *replaces* it rather than
+   stacking a second, staler account.
+
+Repeated interruption of one task is normal — a large task legitimately spans
+several usage windows — so the circuit breaker is **progress, not attempt
+count**: two consecutive attempts with no turns and no file changes block
+further recovery (`--force` overrides) on the grounds that the problem is
+environmental, not a limit.
+
+Exit codes: `10` held, `11` urgent halt, **`12` interrupted**.
+
+Two carve-outs worth knowing: `--max-turns` firing stays a **defect** (it is the
+user's own circuit breaker; recovering it would re-run straight back into the
+cap), and the WIP commit refuses to run if a dirty path looks like a credential
+(`git.SECRET_GLOBS`) — an automated `git add -A` is exactly how the "never
+commit secrets" rule gets broken by accident.
 
 ## Carry-forward context
 
@@ -359,12 +434,25 @@ because fresh-context-per-task is the whole point.
 - No retry beyond what the target instructions describe. Failed tasks stay
   failed until the user moves them back to `pending/`.
 - No parallelism. Tasks are strictly sequential.
-- **Git is startup-only.** Odin verifies a clean tree and selects/creates
-  the one branch the whole queue lands on, then checks it out — once,
-  before the loop. It never commits, pushes, merges, or opens PRs;
-  per-task commits stay the target instructions' job. (This narrows the
-  original "no git operations" non-goal — approved deliberately. `--no-git`
-  restores the zero-git behaviour for non-git projects.)
+- **Git is startup-only, plus exactly one commit.** Odin verifies a clean tree
+  and selects/creates the one branch the whole queue lands on, then checks it
+  out — once, before the loop. Per-task milestone commits stay the target
+  instructions' job. (This narrows the original "no git operations" non-goal —
+  approved deliberately. `--no-git` restores the zero-git behaviour for non-git
+  projects.)
+
+  The **one** exception is the recovery WIP checkpoint (`git.commit_wip`): when
+  a run is interrupted mid-task, `odin recover` commits the partial work it left
+  behind as a single `wip(odin): …` commit so the queue can restart against a
+  clean tree. This was approved deliberately as decision 1 of the interruption
+  recovery design — it automates a step the user was already performing by hand,
+  and it removes the need for any dirty-tree waiver machinery. It is never
+  silent: it happens only on the recovery path, only with consent (a TTY prompt
+  or `--recover`), it is previewable with `--dry-run`, and `--no-wip-commit`
+  opts out. Odin still **never** pushes, merges, rebases, amends, or opens PRs,
+  and never rewrites history — including the WIP commit itself, which is left in
+  place carrying `Odin-WIP:` / `Odin-Run:` trailers so it is greppable and
+  squashable at the user's leisure.
 
 ## Install and invocation model
 

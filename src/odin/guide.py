@@ -275,9 +275,19 @@ _FLOW = """\
   terminal it shows the question and you answer inline; unattended it writes a
   `held/` file you fill in and `odin resume <stem>`. Either way the task re-runs
   in a fresh session with your answer in context.
-- **Routing.** Clean completion → `done/`; questions → `held/`; anything else
-  (crash, no protocol block, hit max turns) → `failed/`. Files are moved,
-  never deleted — the queue is the audit trail.
+- **Routing.** Clean completion → `done/`; questions → `held/`; cut off
+  mid-work (usage limit, hard kill) → `interrupted/`; anything else (no
+  protocol block, hit max turns) → `failed/`. Files are moved, never deleted —
+  the queue is the audit trail.
+- **Interrupted → recover.** If the agent is stopped mid-task by a provider
+  usage limit — or the odin process itself dies, stranding the file in
+  `running/` — the task is recoverable, not broken. `odin recover` (or just
+  `odin run`, which offers it at startup) commits the partial work as one
+  `wip(odin): …` checkpoint so the tree is clean, writes a **resumption brief**
+  into the task explaining what its own previous attempt already did, and puts
+  it back in `pending/`. The next agent is told it is continuing, not starting
+  fresh — which commit holds the half-finished work, which commit was the last
+  real milestone, and to reconcile before writing anything.
 - **Discovered work.** A completed task may also emit a `<<<FOLLOW_UP>>>` block
   (see the protocol section). Non-urgent items are filed in that queue's
   `backlog/` and called out when the queue finishes; urgent items are inserted
@@ -412,6 +422,12 @@ _RUN = """\
     odin status queue                  # overview of every named queue, newest first
     odin status <name>                 # drill into one (bare name works here too)
 
+    odin resume <stem>                 # a HELD task, once you've answered it
+    odin recover [<stem>] [<name>]     # a task cut off mid-work (usage limit,
+                                       #   killed process). Commits the partial
+                                       #   work, briefs the next agent, requeues.
+                                       #   --dry-run shows the plan first.
+
 Bare names resolve under `./queue/` (`odin run add-auth` == `odin run
 queue/add-auth`). A natural pattern is one branch per batch via `--branch`.
 
@@ -425,6 +441,12 @@ for v1; the demo readme notes a manual Cursor CLI smoke-test).
 
 On a TTY the Odin tab shows live status (title + progress bar; `--notify` adds
 iTerm2 attention/color), so you can leave a batch running and glance over.
+
+If a run stops because the provider's usage window ran out, `odin run` says so,
+reports when the limit lifts, and offers to recover and wait it out —
+`--recover --wait-for-reset` does both unattended, so an overnight queue can
+finish itself. Unattended runs otherwise halt at exit **12** and print the
+`odin recover` command rather than committing anything on your behalf.
 """
 
 

@@ -274,6 +274,7 @@ class CursorBackend(AgentBackend):
             exit_code=exit_code,
             session_id=session_id,
             platform=self.name,
+            stderr=stderr,
             wall_ms=wall_ms,
             duration_ms=duration_ms,
             api_ms=api_ms,
