@@ -63,6 +63,11 @@ class RunResult:
     num_turns: int | None = None      # turns the agent took
     usage: dict | None = None         # token usage block (backend-normalised or raw)
     cost_usd: float | None = None     # total cost from the terminal event, if any
+    #: HTTP status when the provider rejected the request outright (Claude Code
+    #: reports `api_error_status`). A 4xx here means the run never started —
+    #: unknown model, bad key, no access — which is a config error, not an
+    #: interruption. See `AgentBackend.classify_failure`.
+    api_error_status: int | None = None
 
 
 def run_agent(

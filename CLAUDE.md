@@ -88,7 +88,8 @@ odin status [QUEUE_DIR]
 odin resume HELD_TASK [QUEUE_DIR]
 odin recover [STEM] [QUEUE_DIR] [--project PATH] [--dry-run] [--no-wip-commit]
             [--no-brief] [--verify-cmd CMD] [--wait-for-reset] [--max-wait MIN]
-            [--force] [--yes]
+            [--platform NAME] [--model MODEL] [--branch NAME]
+            [--run] [--no-run] [--force] [--yes]
 odin guide  [TOPIC]
 odin archive [QUEUE_DIR]
 odin metrics [--html [PATH]] [--project SUBSTR] [--file PATH]
@@ -111,6 +112,13 @@ stranded in `running/` by an odin process that died) at startup and offers to
 recover it. Non-interactive runs **halt at exit 12** and print the command
 instead — `-y` skips the platform confirmation and is deliberately *not* consent
 to write a commit; only `--recover` is.
+
+Recovery restores state; **running the queue is a separate decision**, taken by
+a TTY prompt (default yes) or `--run` / `--no-run`. `--platform`, `--model` and
+`--branch` are forwarded into the continuation, which re-enters `main(["run",
+…])` rather than reimplementing the loop. Recovery always ends by *saying* it
+worked (`✓ recovered · … (N tasks ready)`) plus the literal next command: the
+mechanical `→` lines alone once made a crash after them read as total failure.
 
 `odin archive` operates on a **container** of named sub-queues: it moves every
 *fully finished* sub-queue (nothing in pending/running/held/failed/backlog and
@@ -302,6 +310,16 @@ in another tool. Interrupted work blocks `odin archive`, and a recovered task
 stays distinguishable afterwards: its sidecar survives in `interrupted/` with
 the full attempt log.
 
+There is a **third** kind that lands in neither dir: `FailureKind.CONFIG`, the
+provider refusing the request (unknown model, bad key, no access —
+`api_error_status` 4xx other than 429). No work was attempted, so the task goes
+straight back to `pending/` via `queue.return_to_pending`, nothing is committed,
+no sidecar is written, and no metrics task row is recorded (there was no session
+to measure). Exit 2. Structural, not message-matching, exactly like the
+interruption rule: 429 and 5xx stay interruptions. Getting this wrong is not
+theoretical — a transposed `--model opus-claude-5` classified as an interruption
+and had `git add -A` sweep 5000 lines of unrelated work into a WIP commit.
+
 A **container** (a dir of named sub-queues, not a queue itself) additionally
 grows `archive/<name>/` — whole finished sub-queues `odin archive` moved out of
 the `odin status` overview.
@@ -372,7 +390,8 @@ count**: two consecutive attempts with no turns and no file changes block
 further recovery (`--force` overrides) on the grounds that the problem is
 environmental, not a limit.
 
-Exit codes: `10` held, `11` urgent halt, **`12` interrupted**.
+Exit codes: `10` held, `11` urgent halt, **`12` interrupted**, `2` config error
+(refused request / bad model — the usage-error code, because that is what it is).
 
 Two carve-outs worth knowing: `--max-turns` firing stays a **defect** (it is the
 user's own circuit breaker; recovering it would re-run straight back into the

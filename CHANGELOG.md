@@ -7,6 +7,42 @@ with `uv tool install --from 'git+https://github.com/hglattergotz/odin@vX.Y.Z' o
 
 ## [Unreleased]
 
+### Fixed
+- **Every interactive recovery path crashed.** The three prompts added with
+  interruption recovery called `ask_continue("…", default=…)` against a
+  function that took neither a question nor a default, so `odin run`'s startup
+  offer, its in-loop offer, the reset-wait offer and `odin recover`'s
+  "continue?" all raised `TypeError`. Only `--recover` worked, because it
+  returns before reaching a prompt. `ask_continue` now takes both, and the
+  tests drive the real function through a fake TTY instead of stubbing it —
+  stubbing is what let this ship twice.
+- **A rejected request is no longer treated as an interruption.** A typo'd
+  `--model` made Claude Code return a 404, which Odin read structurally as "the
+  turn didn't end on the agent's terms" and filed under `interrupted/`. That
+  was recoverable-looking enough to commit the whole working tree as a WIP
+  checkpoint. Backends now read `api_error_status`: a 4xx other than 429 is a
+  new `FailureKind.CONFIG` — the task stays in `pending/`, nothing is
+  committed, no sidecar is written, and Odin exits **2** quoting the provider's
+  own explanation. 429 and 5xx remain interruptions.
+
+### Added
+- **Model names are checked before the run starts.** `odin run --model
+  opus-claude-5` now fails immediately, naming the accepted forms, instead of
+  starting a queue that dies on its first task. A shape check, not a
+  catalogue — Odin cannot know which models exist, so it only rules out names
+  that match neither an alias (`opus`, `sonnet`, `haiku`, `fable`, optionally
+  versioned) nor a full name (`claude-…`, or a bedrock/vertex id).
+- `odin recover` learned `--platform`, `--model` and `--branch`, and forwards
+  them into the continuation run. It previously accepted none of them and
+  handed off to `odin run` with only the queue and project, so the
+  continuation silently resolved the platform from config or env.
+- `odin recover --run` / `--no-run` for non-interactive control of the
+  continuation. `--yes` is now a deprecated alias for `--no-run`.
+- `odin recover` ends with an explicit `✓ recovered · <task> is back in
+  pending/ (N tasks ready)` and the literal next command, flags included. It
+  previously ended on its last mechanical step, so a crash right after it read
+  as total failure even though every write had landed.
+
 ## [0.2.6] — 2026-07-26
 
 ### Fixed

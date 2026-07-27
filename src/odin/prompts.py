@@ -345,27 +345,46 @@ def _set_model(
 # ----------------------------------------------------------------------
 
 def ask_continue(
+    question: str | None = None,
     *,
+    default: bool = True,
     in_: TextIO | None = None,
     out: TextIO | None = None,
 ) -> bool:
-    """Ask whether to continue the run after an urgent insert. True=continue.
+    """Ask a yes/no question. True=go ahead.
 
-    Empty input defaults to continue; EOF defaults to stop (the safe choice
-    when there's nobody to answer).
+    With no `question` this is the original urgent-insert prompt, worded
+    continue/stop. With one it renders `  <question> [Y/n]: ` (or `[y/N]` when
+    `default` is False), which is what the recovery prompts need.
+
+    Empty input takes `default`; EOF returns False regardless — with nobody
+    there to answer, not acting is always the safe half of these questions
+    (don't recover, don't sleep for hours, don't start burning tokens).
     """
     in_ = in_ or sys.stdin
     out = out or sys.stdout
+    if question is None:
+        prompt, accept_yes, accept_no, retry = (
+            "  Continue the run now? [C]ontinue / [s]top: ",
+            ("c", "continue"), ("s", "stop"), "  Please type c or s.\n",
+        )
+    else:
+        prompt, accept_yes, accept_no, retry = (
+            f"  {question} [{'Y/n' if default else 'y/N'}]: ",
+            ("y", "yes"), ("n", "no"), "  Please type y or n.\n",
+        )
     while True:
-        ans = _readline(in_, out, "  Continue the run now? [C]ontinue / [s]top: ")
+        ans = _readline(in_, out, prompt)
         if ans is None:
             return False
         a = ans.strip().lower()
-        if a in ("", "c", "continue"):
+        if a == "":
+            return default
+        if a in accept_yes:
             return True
-        if a in ("s", "stop"):
+        if a in accept_no:
             return False
-        out.write("  Please type c or s.\n")
+        out.write(retry)
 
 
 def _readline(in_: TextIO, out: TextIO, prompt: str) -> str | None:

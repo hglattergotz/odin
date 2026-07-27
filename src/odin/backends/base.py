@@ -42,10 +42,17 @@ class FailureKind(str, Enum):
     DEFECT: the agent finished its turn on its own terms and produced something
     Odin could not use (no sentinel block, malformed output). A human should
     look at it.
+
+    CONFIG: the provider rejected the request outright — an unknown model, a
+    bad key, no access. No work was attempted, so there is nothing to recover
+    and nothing wrong with the task. Treating this as an interruption is what
+    made a typo'd `--model` commit the working tree and strand the task in
+    `interrupted/`; the task must stay exactly where it was.
     """
 
     INTERRUPTED = "interrupted"
     DEFECT = "defect"
+    CONFIG = "config"
 
 
 @dataclass(frozen=True)
@@ -67,6 +74,10 @@ class Failure:
     @property
     def interrupted(self) -> bool:
         return self.kind is FailureKind.INTERRUPTED
+
+    @property
+    def config_error(self) -> bool:
+        return self.kind is FailureKind.CONFIG
 
 
 def ended_on_agents_terms(result: "RunResult") -> bool:
@@ -158,6 +169,24 @@ class AgentBackend(ABC):
         git-workflow conflict lint. Paths are relative to the project dir.
         """
         raise NotImplementedError
+
+    def validate_model(self, model: str) -> str | None:
+        """Reject a model name that cannot be right, before the run starts.
+
+        Returns an error message, or None when the name is plausible. A shape
+        check only — Odin cannot know a provider's live catalogue, and refusing
+        a model that actually works would be worse than letting the provider
+        say so. It exists to catch the typo (`opus-claude-5` for
+        `claude-opus-5`) that otherwise costs a queue move and a WIP commit
+        before anyone finds out.
+
+        Backends that cannot say anything useful should not override it.
+        """
+        return None
+
+    def model_help(self) -> str:
+        """One line naming the accepted `--model` forms, for error messages."""
+        return ""
 
     @abstractmethod
     def build_invoke(

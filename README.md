@@ -148,6 +148,19 @@ milestone, what it said before it stopped — and moves the task back to
 `pending/`. Plain `odin run` is the primary door: on a TTY it spots the
 interrupted task at startup and offers to recover it.
 
+Recovery restores state; **running is a separate decision**. On a TTY you're
+asked once, defaulting to yes, and the queue continues in the same process;
+`--platform` / `--model` / `--branch` are passed through to that continuation.
+Anywhere else Odin prints the literal next command rather than start spending
+tokens nobody asked for. `--run` and `--no-run` make the choice explicit for
+scripts.
+
+What is **not** an interruption: a request the provider refuses outright — an
+unknown model, a bad key, no access. Nothing ran, so there is nothing to
+recover. Odin leaves the task in `pending/`, commits nothing, and exits 2
+quoting the provider's reason. A misspelled `--model` is caught earlier still,
+before the run starts.
+
 **Unattended runs never commit on your behalf.** They halt at exit **12** and
 print the command instead. Two flags opt in:
 

@@ -599,7 +599,7 @@ def test_run_unknown_platform_errors_clearly(setup, capsys, monkeypatch):
 
 def test_run_model_from_env(setup, tmp_path, monkeypatch):
     """$ODIN_MODEL supplies the model when no --model flag is given."""
-    monkeypatch.setenv("ODIN_MODEL", "env-model-id")
+    monkeypatch.setenv("ODIN_MODEL", "claude-env-model-id")
     project, qdir, _ = setup
     log = tmp_path / "argv.log"
     rec = _arg_recorder(tmp_path / "recorder.sh", log)
@@ -610,7 +610,7 @@ def test_run_model_from_env(setup, tmp_path, monkeypatch):
     assert rc == 0
     logged = log.read_text().splitlines()
     assert "--model" in logged
-    assert "env-model-id" in logged
+    assert "claude-env-model-id" in logged
 
 
 # ----------------------------------------------------------------------

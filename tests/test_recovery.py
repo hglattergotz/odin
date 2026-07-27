@@ -13,6 +13,7 @@ tests pin down:
 
 from __future__ import annotations
 
+import io
 import stat
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -162,6 +163,76 @@ def test_other_backends_default_to_defect():
 
     failure = CursorBackend().classify_failure(_result(exit_code=1))
     assert failure.kind is FailureKind.DEFECT
+
+
+# ----------------------------------------------------------------------
+# a refused request is neither an interruption nor a defect
+# ----------------------------------------------------------------------
+# Ground truth from `claude --model definitely-not-a-model`: the terminal event
+# carries is_error=true with subtype="success" (so the label alone says
+# nothing), terminal_reason="api_error" and api_error_status=404. Without the
+# status Odin saw only "exit 1, didn't end on the agent's terms" and called a
+# typo'd model an interruption — which then committed the working tree.
+
+def test_unknown_model_is_a_config_error_not_an_interruption():
+    failure = ClaudeBackend().classify_failure(_result(
+        exit_code=1, api_error_status=404,
+        error="agent reported is_error with subtype=success",
+        final_text="There's an issue with the selected model (opus-claude-5). "
+                   "It may not exist or you may not have access to it.",
+    ))
+    assert failure.kind is FailureKind.CONFIG
+    assert failure.config_error and not failure.interrupted
+    assert failure.reason == "api_404"
+    assert "opus-claude-5" in failure.detail   # the provider's own words
+
+
+def test_auth_rejection_is_also_a_config_error():
+    for status in (400, 401, 403):
+        failure = ClaudeBackend().classify_failure(
+            _result(exit_code=1, api_error_status=status)
+        )
+        assert failure.kind is FailureKind.CONFIG, status
+
+
+def test_429_and_5xx_remain_interruptions():
+    """A rate limit or a bad day at the provider is exactly what recovery is for."""
+    for status in (429, 500, 529):
+        failure = ClaudeBackend().classify_failure(
+            _result(exit_code=1, api_error_status=status)
+        )
+        assert failure.kind is FailureKind.INTERRUPTED, status
+
+
+def test_no_api_status_still_classifies_structurally():
+    """The status only *adds* a tier; nothing depends on its presence."""
+    failure = ClaudeBackend().classify_failure(_result(exit_code=1, error="boom"))
+    assert failure.kind is FailureKind.INTERRUPTED
+
+
+# ----------------------------------------------------------------------
+# model-name pre-flight
+# ----------------------------------------------------------------------
+
+def test_model_shape_accepts_real_names():
+    b = ClaudeBackend()
+    for good in ("opus", "sonnet", "haiku", "fable", "opusplan", "opus-4.5",
+                 "sonnet-4-5", "opus[1m]", "claude-opus-5", "claude-opus-5[1m]",
+                 "claude-3-5-sonnet-20241022", "us.anthropic.claude-opus-4-v1"):
+        assert b.validate_model(good) is None, good
+
+
+def test_model_shape_catches_the_transposition():
+    """`opus-claude-5` is the typo that started all this."""
+    b = ClaudeBackend()
+    for bad in ("opus-claude-5", "sonnet-claude", "claude5", "gpt-4", ""):
+        assert b.validate_model(bad) is not None, bad
+
+
+def test_backends_without_an_opinion_accept_anything():
+    from odin.backends.cursor import CursorBackend
+
+    assert CursorBackend().validate_model("composer-2.5") is None
 
 
 # ----------------------------------------------------------------------
@@ -570,8 +641,18 @@ def test_ctrl_c_during_wait_stops_cleanly():
 # behaviour should not have to retype it on every run. Config is the standing
 # default; an explicit flag always wins over it.
 
-class _FakeStdin:
-    def __init__(self, tty: bool) -> None:
+class _FakeStdin(io.StringIO):
+    """A stdin that can claim to be a TTY *and* be read from.
+
+    Readable on purpose: the recovery prompts must be exercised through the
+    real `ask_continue`. Stubbing it out is how 0.2.5 and 0.2.6 shipped with
+    every interactive recovery path raising TypeError — the call sites passed a
+    question and a default to a function that accepted neither, and the only
+    test that reached them had replaced it with a lambda.
+    """
+
+    def __init__(self, tty: bool, text: str = "") -> None:
+        super().__init__(text)
         self._tty = tty
 
     def isatty(self) -> bool:
@@ -631,14 +712,41 @@ def test_config_cap_can_refuse_a_wait_the_flag_asked_for(tmp_path, monkeypatch):
 def test_config_auto_recover_false_suppresses_the_offer(tmp_path, monkeypatch):
     from odin.cli import _may_recover
 
-    monkeypatch.setattr("odin.cli.sys.stdin", _FakeStdin(True))
-    monkeypatch.setattr("odin.cli.ask_continue", lambda *a, **k: True)
+    # Real ask_continue, answered "y" — never a stub. See _FakeStdin.
+    monkeypatch.setattr("odin.cli.sys.stdin", _FakeStdin(True, "y\n"))
     assert _may_recover(_run_args())
 
     _with_config(tmp_path, monkeypatch, "[recovery]\nauto_recover = false\n")
     assert not _may_recover(_run_args())
     # ...but typing --recover still means it.
     assert _may_recover(_run_args("--recover"))
+
+
+# ----------------------------------------------------------------------
+# the interactive prompts, exercised for real
+# ----------------------------------------------------------------------
+
+def test_recovery_offer_accepts_and_declines(monkeypatch):
+    """`odin run`'s "Recover and continue?" — both answers, real prompt."""
+    from odin.cli import _may_recover
+
+    monkeypatch.setattr("odin.cli.sys.stdin", _FakeStdin(True, "\n"))
+    assert _may_recover(_run_args()) is True       # empty → default yes
+    monkeypatch.setattr("odin.cli.sys.stdin", _FakeStdin(True, "n\n"))
+    assert _may_recover(_run_args()) is False
+
+
+def test_wait_offer_defaults_to_not_sleeping(monkeypatch):
+    """"Wait 2h13m?" defaults to no — idling for hours must be chosen."""
+    import io as _io
+
+    from odin.cli import _should_wait
+
+    resets = datetime.now().astimezone() + timedelta(minutes=10)
+    monkeypatch.setattr("odin.cli.sys.stdin", _FakeStdin(True, "\n"))
+    assert _should_wait(_run_args(), resets, out=_io.StringIO()) is False
+    monkeypatch.setattr("odin.cli.sys.stdin", _FakeStdin(True, "y\n"))
+    assert _should_wait(_run_args(), resets, out=_io.StringIO()) is True
 
 
 # ----------------------------------------------------------------------
@@ -827,6 +935,164 @@ def test_cmd_recover_blocked_after_two_dead_attempts(tmp_path, monkeypatch, caps
     )
     assert _cmd_recover(args) == 0
     assert (q.root / "pending" / "080-ui-port.md").exists()
+
+
+def _refusing_agent(status: int = 404, text: str = ""):
+    """An agent CLI whose request the provider refuses — nothing runs."""
+    message = text or ("There's an issue with the selected model "
+                       "(opus-claude-5). It may not exist or you may not have "
+                       "access to it.")
+
+    def fake(*a, **k):
+        return _result(exit_code=1, api_error_status=status, final_text=message,
+                       error="agent reported is_error with subtype=success",
+                       num_turns=1, wall_ms=1770)
+    return fake
+
+
+def test_refused_request_leaves_the_queue_exactly_as_it_was(tmp_path, monkeypatch, capsys):
+    """A typo'd model must not move the task, commit, or invent an interruption."""
+    project, q = _cli_setup(tmp_path)
+    before = _log(project, "rev-parse", "HEAD")
+    monkeypatch.setattr("odin.cli.run_agent", _refusing_agent())
+    monkeypatch.setattr("sys.stdin", type("S", (), {"isatty": staticmethod(lambda: False)})())
+
+    rc = _run(["run", str(q.root), "--project", str(project), "--platform", "claude",
+               "--no-metrics", "-y"])
+
+    assert rc == 2
+    assert (q.root / "pending" / "080-ui-port.md").exists()      # never left pending/
+    assert not (q.root / "interrupted" / "080-ui-port.md").exists()
+    assert not (q.root / "failed" / "080-ui-port.md").exists()
+    assert not q.recovery_path("080-ui-port").exists()           # no sidecar
+    assert _log(project, "rev-parse", "HEAD") == before          # no WIP commit
+    out = capsys.readouterr().out
+    assert "not started" in out
+    assert "opus-claude-5" in out                                # the provider's reason
+    assert "still in pending/" in out
+
+
+def test_refused_request_is_not_recorded_as_a_failed_task(tmp_path, monkeypatch):
+    """Nothing ran, so metrics must not gain a hollow failure row."""
+    project, q = _cli_setup(tmp_path)
+    monkeypatch.setattr("odin.cli.run_agent", _refusing_agent())
+    monkeypatch.setattr("sys.stdin", type("S", (), {"isatty": staticmethod(lambda: False)})())
+    events = tmp_path / "events.jsonl"
+    monkeypatch.setenv("ODIN_METRICS_FILE", str(events))
+
+    assert _run(["run", str(q.root), "--project", str(project),
+                 "--platform", "claude", "-y"]) == 2
+    assert not events.exists() or events.read_text().strip() == ""
+
+
+def test_bad_model_is_refused_before_anything_runs(tmp_path, monkeypatch, capsys):
+    """The pre-flight shape check: no agent process, no queue move at all."""
+    project, q = _cli_setup(tmp_path)
+
+    def explode(*a, **k):
+        raise AssertionError("the agent must never be invoked")
+
+    monkeypatch.setattr("odin.cli.run_agent", explode)
+    rc = _run(["run", str(q.root), "--project", str(project), "--platform", "claude",
+               "--model", "opus-claude-5", "--no-metrics", "-y"])
+
+    assert rc == 2
+    assert (q.root / "pending" / "080-ui-port.md").exists()
+    err = capsys.readouterr().err
+    assert "does not look like a Claude Code model name" in err
+    assert "claude-opus-5" in err          # the accepted forms are shown
+
+
+def _interrupt_one(q: Queue, stem: str = "080-ui-port") -> None:
+    """Put `stem` into interrupted/ with a one-attempt sidecar."""
+    running = q.claim_running(Task.from_path(q.root / "pending" / f"{stem}.md"))
+    record = recovery.Record(stem=stem)
+    record.add(_attempt(turns=40, files=2))
+    q.mark_interrupted(running, recovery.render_sidecar(record))
+
+
+def test_recover_says_plainly_that_it_worked(tmp_path, monkeypatch, capsys):
+    """0.2.5 printed only the mechanical steps, so a crash after them read as
+    total failure even though every write had landed."""
+    from odin.cli import _build_parser, _cmd_recover
+
+    project, q = _cli_setup(tmp_path)
+    _interrupt_one(q)
+    monkeypatch.setattr("sys.stdin", type("S", (), {"isatty": staticmethod(lambda: False)})())
+
+    args = _build_parser().parse_args(
+        ["recover", "080-ui-port", str(q.root), "--project", str(project)]
+    )
+    assert _cmd_recover(args) == 0
+    out = capsys.readouterr().out
+    assert "recovered" in out
+    assert "back in pending/" in out
+    assert "1 task ready" in out
+    assert f"Next: odin run {q.root.name}" in out
+
+
+def test_recover_next_command_carries_the_flags_you_gave_it(tmp_path, monkeypatch, capsys):
+    from odin.cli import _build_parser, _cmd_recover
+
+    project, q = _cli_setup(tmp_path)
+    _interrupt_one(q)
+    monkeypatch.setattr("sys.stdin", type("S", (), {"isatty": staticmethod(lambda: False)})())
+
+    args = _build_parser().parse_args([
+        "recover", "080-ui-port", str(q.root), "--project", str(project),
+        "--platform", "claude", "--model", "claude-opus-5", "--branch", "ui-port",
+    ])
+    assert _cmd_recover(args) == 0
+    out = capsys.readouterr().out
+    assert "--platform claude" in out
+    assert "--model claude-opus-5" in out
+    assert "--branch ui-port" in out
+
+
+def test_recover_asks_before_running_and_takes_no_for_an_answer(tmp_path, monkeypatch, capsys):
+    """The middle ground: one keypress on a TTY, but never a surprise run."""
+    from odin.cli import _build_parser, _cmd_recover
+
+    project, q = _cli_setup(tmp_path)
+    _interrupt_one(q)
+
+    def explode(*a, **k):
+        raise AssertionError("declining must not start the queue")
+
+    monkeypatch.setattr("odin.cli.run_agent", explode)
+    monkeypatch.setattr("odin.cli.sys.stdin", _FakeStdin(True, "n\n"))
+    args = _build_parser().parse_args(
+        ["recover", "080-ui-port", str(q.root), "--project", str(project)]
+    )
+    assert _cmd_recover(args) == 0
+    assert "Next: odin run" in capsys.readouterr().out
+
+
+def test_recover_no_run_never_prompts(tmp_path, monkeypatch, capsys):
+    from odin.cli import _build_parser, _cmd_recover
+
+    project, q = _cli_setup(tmp_path)
+    _interrupt_one(q)
+    # A TTY with nothing to read: if it prompted, ask_continue would see EOF.
+    monkeypatch.setattr("odin.cli.sys.stdin", _FakeStdin(True, ""))
+    args = _build_parser().parse_args(
+        ["recover", "080-ui-port", str(q.root), "--project", str(project), "--no-run"]
+    )
+    assert _cmd_recover(args) == 0
+    out = capsys.readouterr().out
+    assert "Continue the queue now?" not in out
+    assert "Next: odin run" in out
+
+
+def test_recover_run_and_no_run_contradict(tmp_path, capsys):
+    from odin.cli import _build_parser, _cmd_recover
+
+    project, q = _cli_setup(tmp_path)
+    args = _build_parser().parse_args(
+        ["recover", str(q.root), "--project", str(project), "--run", "--no-run"]
+    )
+    assert _cmd_recover(args) == 2
+    assert "contradict" in capsys.readouterr().err
 
 
 def test_startup_adopts_a_stranded_running_file(tmp_path, monkeypatch):

@@ -71,6 +71,45 @@ def _error_label(terminal_event: dict) -> str | None:
 
 
 # ----------------------------------------------------------------------
+# model-name shape check (pre-flight; see AgentBackend.validate_model)
+# ----------------------------------------------------------------------
+#: Family aliases Claude Code accepts in place of a full model name.
+_MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable")
+
+#: Deliberately shape-based, never a catalogue: Odin cannot know which models
+#: exist today, and a list would rot into false rejections of models that work.
+#: What it *can* say is that a name is not one of the two documented forms.
+#: The version suffix must start with a digit, which is what separates
+#: `opus-4.5` (a real alias+version) from `opus-claude-5` (a transposition).
+_MODEL_SHAPE = re.compile(
+    r"""^(?:
+          claude[-.].+                       # full name: claude-opus-5, claude-3-5-…
+        | .*anthropic\..+                    # bedrock / vertex ids
+        | (?:opus|sonnet|haiku|fable)        # family alias…
+          (?:plan)?                          #   …incl. opusplan
+          (?:[-.]\d[\w.\-]*)?                #   …with an optional version
+          (?:\[[\w.]+\])?                    #   …and an optional [1m]-style tag
+        )$""",
+    re.VERBOSE | re.IGNORECASE,
+)
+
+
+def _api_error_status(terminal_event: dict) -> int | None:
+    """HTTP status when the provider rejected the request, else None.
+
+    Claude Code puts `api_error_status` on the terminal event and sets
+    `terminal_reason: "api_error"`. This is the difference between "your
+    request was refused" (a 4xx: unknown model, bad key, no access) and "the
+    agent was cut off" — a distinction the `is_error`/`subtype` pair cannot
+    make, since a 404 arrives labelled `subtype: "success"`.
+    """
+    status = terminal_event.get("api_error_status")
+    if isinstance(status, bool) or not isinstance(status, (int, float)):
+        return None
+    return int(status)
+
+
+# ----------------------------------------------------------------------
 # provider-limit recognition (enrichment only — never routing)
 # ----------------------------------------------------------------------
 # Odin decides *that* a run was interrupted structurally (see
@@ -166,6 +205,18 @@ class ClaudeBackend(AgentBackend):
 
     def instruction_files(self) -> list[Path]:
         return [Path("CLAUDE.md")]
+
+    def validate_model(self, model: str) -> str | None:
+        if _MODEL_SHAPE.match(model.strip()):
+            return None
+        return f"'{model}' does not look like a Claude Code model name"
+
+    def model_help(self) -> str:
+        return (
+            "Accepted: an alias (" + ", ".join(_MODEL_ALIASES) + "), optionally "
+            "with a version (opus-4.5), or a full name (claude-opus-5). "
+            "Omit --model to use Claude Code's own default."
+        )
 
     def build_invoke(
         self,
@@ -283,6 +334,20 @@ class ClaudeBackend(AgentBackend):
                 detail="hit the --max-turns cap mid-work",
             )
 
+        # The provider refused the request. A 4xx that is not 429 says the run
+        # never started — unknown model, bad key, no access — so there is no
+        # partial work and nothing to recover. 429 is a rate/usage limit and
+        # 5xx is the provider having a bad day: both are interruptions, so they
+        # fall through to the tiers below.
+        status = result.api_error_status
+        if status is not None and 400 <= status < 500 and status != 429:
+            return Failure(
+                kind=FailureKind.CONFIG,
+                confidence="confirmed",
+                reason=f"api_{status}",
+                detail=(result.final_text or "").strip()[:300],
+            )
+
         haystack = f"{result.final_text}\n{result.stderr}"
         if any(p.search(haystack) for p in _LIMIT_PATTERNS):
             return Failure(
@@ -330,6 +395,7 @@ class ClaudeBackend(AgentBackend):
         duration_ms: int | None = None
         api_ms: int | None = None
         num_turns: int | None = None
+        api_status: int | None = None
 
         if terminal_event is not None:
             final_text = terminal_event.get("result") or ""
@@ -341,6 +407,7 @@ class ClaudeBackend(AgentBackend):
             api_ms = terminal_event.get("duration_api_ms")
             num_turns = terminal_event.get("num_turns")
             error = _error_label(terminal_event)
+            api_status = _api_error_status(terminal_event)
 
         # A hard kill (SIGKILL, OOM, dropped connection) produces no terminal
         # event at all, leaving nothing to diagnose or to build a resumption
@@ -370,4 +437,5 @@ class ClaudeBackend(AgentBackend):
             num_turns=num_turns,
             usage=usage,
             cost_usd=cost_usd,
+            api_error_status=api_status,
         )
