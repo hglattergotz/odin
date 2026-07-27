@@ -147,6 +147,43 @@ def test_ask_continue_reprompts_on_garbage():
     assert "Please type c or s" in out.getvalue()
 
 
+# ----- ask_continue with a question (the recovery prompts) -----------
+# Every recovery prompt calls this form. It did not exist until 0.2.7 — the
+# three call sites added with recovery passed a question and a default to a
+# function that took neither, so every interactive recovery raised TypeError.
+
+def test_ask_continue_question_takes_the_default_on_empty_input():
+    out = io.StringIO()
+    assert ask_continue("Recover and continue?", default=True,
+                        in_=io.StringIO("\n"), out=out) is True
+    assert "Recover and continue? [Y/n]:" in out.getvalue()
+
+    out = io.StringIO()
+    assert ask_continue("Wait 2h13m?", default=False,
+                        in_=io.StringIO("\n"), out=out) is False
+    assert "Wait 2h13m? [y/N]:" in out.getvalue()
+
+
+def test_ask_continue_question_explicit_answers_beat_the_default():
+    assert ask_continue("Go?", default=False, in_=io.StringIO("y\n"),
+                        out=io.StringIO()) is True
+    assert ask_continue("Go?", default=True, in_=io.StringIO("no\n"),
+                        out=io.StringIO()) is False
+
+
+def test_ask_continue_question_eof_never_acts():
+    """No one there to answer → the half that does nothing, whatever the default."""
+    assert ask_continue("Go?", default=True, in_=io.StringIO(""),
+                        out=io.StringIO()) is False
+
+
+def test_ask_continue_question_reprompts_on_garbage():
+    out = io.StringIO()
+    assert ask_continue("Go?", default=True, in_=io.StringIO("maybe\nn\n"),
+                        out=out) is False
+    assert "Please type y or n" in out.getvalue()
+
+
 # ----- ask_run_confirmation ------------------------------------------
 
 def _confirm_kwargs(**overrides):

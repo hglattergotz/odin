@@ -396,9 +396,35 @@ def _build_parser() -> argparse.ArgumentParser:
         help="recover even though the last two attempts made no progress "
              "(which usually means the problem is not a usage limit)",
     )
+    # Recovery hands off into a real `odin run`, so it has to be able to say
+    # which platform/model/branch that run uses — otherwise the continuation
+    # silently falls back to config and env.
+    rc.add_argument(
+        "--platform", default=None, metavar="NAME",
+        help="agent platform for the continuation run (claude, cursor, grok)",
+    )
+    rc.add_argument(
+        "--model", default=None,
+        help="model for the continuation run",
+    )
+    rc.add_argument(
+        "--branch", default=None, metavar="NAME",
+        help="branch for the continuation run",
+    )
+    rc.add_argument(
+        "--run", action="store_true",
+        help="continue the queue immediately without asking (for scripts; a TTY "
+             "is asked, and answering yes does the same thing)",
+    )
+    rc.add_argument(
+        "--no-run", action="store_true",
+        help="only recover — never continue the queue, and never wait for a "
+             "reset window",
+    )
     rc.add_argument(
         "-y", "--yes", action="store_true",
-        help="don't prompt; recover and print the command to continue",
+        help="deprecated alias for --no-run: recover, then print the command "
+             "to continue",
     )
     rc.set_defaults(func=_cmd_recover)
 
@@ -533,6 +559,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(f"odin: {e}", file=sys.stderr)
         return 2
+    # Check the model name before anything moves. A typo'd model is refused by
+    # the provider on the first task, which used to cost a queue move, a WIP
+    # commit and a stranded task before the user saw the reason.
+    if model:
+        problem = backend.validate_model(model)
+        if problem:
+            print(f"odin: {problem}", file=sys.stderr)
+            help_line = backend.model_help()
+            if help_line:
+                print(f"  {help_line}", file=sys.stderr)
+            return 2
     _warn_ignored_platform_flags(args, platform)
     # Missing-instruction warning must run *after* backend resolution so an
     # AGENTS.md-only Cursor project is not falsely flagged for CLAUDE.md.
@@ -948,7 +985,12 @@ def _run_loop(
             # an empty string is a detached HEAD, which git still tracks.
             backend=backend, project=project, git_on=branch is not None,
         )
-        acc.record_task(task_stem=running.stem, outcome=outcome, result=result)
+        # A refused request is not a task execution: no session, no turns, no
+        # tokens, no cost. Recording it would only inflate the failure rate with
+        # a hollow row — the same reasoning that makes `finish()` skip a run in
+        # which nothing ran.
+        if outcome != "config_error":
+            acc.record_task(task_stem=running.stem, outcome=outcome, result=result)
 
         if outcome == "completed":
             completed += 1
@@ -969,6 +1011,9 @@ def _run_loop(
                 _answer_held_interactively(q, running.stem, questions)
                 continue  # re-picked next loop in a fresh session
             return _print_held_instructions(q, running.stem)
+        if outcome == "config_error":
+            sig.failed(completed)
+            return _print_config_error(q, running.stem, failure, model, backend, out=out)
         if outcome == "interrupted":
             sig.held()  # amber: needs attention, but nothing is broken
             halt = _handle_interruption(
@@ -1020,6 +1065,13 @@ def _route(
             backend.classify_failure(result) if backend is not None
             else Failure(kind=FailureKind.DEFECT)
         )
+        if failure.config_error:
+            # The provider refused the request, so the agent never ran. Put the
+            # task back exactly where it came from: it is not failed (nothing
+            # is wrong with it) and not interrupted (there is nothing to
+            # recover). Fix the config and run again.
+            q.return_to_pending(running)
+            return "config_error", None, None, failure
         if failure.interrupted:
             snap = (
                 git.snapshot(project, ignore_within=q.root)
@@ -1687,6 +1739,38 @@ def _print_recovery_plan(
     print("\n[dry-run] nothing was written.", file=out)
 
 
+def _print_config_error(
+    q: Queue,
+    stem: str,
+    failure: Failure | None,
+    model: str | None,
+    backend: AgentBackend | None = None,
+    *,
+    out: TextIO | None = None,
+) -> int:
+    """The provider refused the request: say so, and leave the queue alone.
+
+    Deliberately not the `failed/` treatment. Nothing is wrong with the task and
+    nothing was attempted, so the only useful output is the provider's own
+    message and what to change before running again.
+    """
+    out = _stdout(out)
+    detail = (failure.detail if failure else "") or "the provider rejected the request"
+    print(file=out)
+    print(style.err(f"{style.GLYPH_FAIL} {stem} · not started · the request was rejected"),
+          file=out)
+    print(f"  {detail}", file=out)
+    print(file=out)
+    print(f"  {stem} is still in pending/ — the queue is unchanged.", file=out)
+    if model and failure and failure.reason == "api_404":
+        print(f"  The model was: {model}", file=out)
+        help_line = backend.model_help() if backend is not None else ""
+        if help_line:
+            print(f"  {help_line}", file=out)
+    print("  Fix the setting above and run the same command again.", file=out)
+    return 2
+
+
 def _print_failed(q: Queue, stem: str, result: RunResult) -> int:
     print()
     print(style.err(
@@ -1909,6 +1993,11 @@ def _cmd_resume(args: argparse.Namespace) -> int:
 
 def _cmd_recover(args: argparse.Namespace) -> int:
     _disambiguate_recover_args(args)
+    if args.run and args.no_run:
+        print("odin: --run and --no-run contradict each other.", file=sys.stderr)
+        return 2
+    # `--yes` predates the pair and meant "don't prompt, don't run".
+    args.no_run = args.no_run or args.yes
     args.queue = _resolve_queue_arg(args.queue)
     project = (args.project or Path.cwd()).resolve()
     if not project.is_dir():
@@ -1967,19 +2056,52 @@ def _cmd_recover(args: argparse.Namespace) -> int:
     if task is None:
         return 12
 
+    _print_recovered(q, stem)
+
     resets_at = getattr(failure, "resets_at", None)
-    if resets_at is not None and not args.yes and _should_wait(args, resets_at):
+    if resets_at is not None and not args.no_run and _should_wait(args, resets_at):
         if not wait.sleep_until(resets_at, max_minutes=_max_wait(args)):
             return 12
         return _continue_after_recovery(q, args)
 
-    if args.yes or not sys.stdin.isatty():
-        print(f"\nodin: {stem} is back in pending/. Run `odin run` to continue.")
-        return 0
-    if ask_continue("Continue the queue now?", default=True):
+    # Recovery restores state; running is a separate decision. On a TTY that
+    # decision is one keypress (default yes, since continuing is why you
+    # recovered); everywhere else Odin prints the command rather than start
+    # spending tokens nobody asked it to spend.
+    if args.run or (not args.no_run and sys.stdin.isatty()
+                    and ask_continue("Continue the queue now?", default=True)):
         return _continue_after_recovery(q, args)
-    print(f"odin: {stem} is back in pending/. Run `odin run` when ready.")
+    print(f"\n  Next: {_continue_command(q, args)}")
     return 0
+
+
+def _print_recovered(q: Queue, stem: str, *, out: TextIO | None = None) -> None:
+    """Say plainly that it worked.
+
+    The mechanical `→` lines say what changed but never that the whole thing
+    succeeded, so a crash right after them (as in 0.2.5) read as total failure
+    when in fact every write had landed.
+    """
+    out = _stdout(out)
+    ready = len(q.pending())
+    print(file=out)
+    print(style.ok(
+        f"{style.GLYPH_OK} recovered · {stem} is back in pending/ "
+        f"({ready} task{'s' if ready != 1 else ''} ready)"
+    ), file=out)
+
+
+def _continue_command(q: Queue, args: argparse.Namespace) -> str:
+    """The literal command that continues this queue, flags and all."""
+    parts = ["odin", "run", q.root.name]
+    for flag, value in (
+        ("--platform", getattr(args, "platform", None)),
+        ("--model", getattr(args, "model", None)),
+        ("--branch", getattr(args, "branch", None)),
+    ):
+        if value:
+            parts += [flag, str(value)]
+    return " ".join(parts)
 
 
 def _disambiguate_recover_args(args: argparse.Namespace) -> None:
@@ -2009,6 +2131,16 @@ def _continue_after_recovery(q: Queue, args: argparse.Namespace) -> int:
     argv = ["run", str(q.root)]
     if args.project:
         argv += ["--project", str(args.project)]
+    # Forward what the user chose. Without this the continuation resolves the
+    # platform from config/env only, so `odin recover --platform claude` would
+    # hand off into a run that ignored the flag (or refused to start).
+    for flag, value in (
+        ("--platform", getattr(args, "platform", None)),
+        ("--model", getattr(args, "model", None)),
+        ("--branch", getattr(args, "branch", None)),
+    ):
+        if value:
+            argv += [flag, str(value)]
     return main(argv)
 
 

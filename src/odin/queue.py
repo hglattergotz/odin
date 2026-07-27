@@ -228,6 +228,15 @@ class Queue:
     def claim_running(self, task: Task) -> Task:
         return self._move(task, "running")
 
+    def return_to_pending(self, task: Task) -> Task:
+        """Undo `claim_running` — the task never really got its turn.
+
+        Used when the provider refuses the request outright (unknown model, bad
+        key): the agent did nothing, so the queue should look untouched rather
+        than gain a `failed/` or `interrupted/` entry the user has to clean up.
+        """
+        return self._move(task, "pending")
+
     def mark_done(self, task: Task) -> Task:
         return self._move(task, "done")
 
