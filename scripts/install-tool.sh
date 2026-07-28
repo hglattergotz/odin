@@ -6,7 +6,13 @@
 #   ./scripts/install-tool.sh
 #   ./scripts/install-tool.sh --editable   # live link; no reinstall needed for edits
 #
-# Requires `uv` on PATH. Uses --force so an existing install is replaced.
+# Requires `uv` on PATH.
+#
+# The flags matter. `--force` alone replaces the *install* but may rebuild from
+# uv's cache, which for a path source keyed on an unchanged version string means
+# you can get a binary that reports the new version while running stale code —
+# the worst possible outcome for "did my fix work?". `--reinstall --no-cache`
+# forces a real rebuild from the working tree. Do not drop them.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -40,7 +46,7 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
-args=(tool install --from "$ROOT" --force)
+args=(tool install --from "$ROOT" --force --reinstall --no-cache)
 if [[ "$EDITABLE" -eq 1 ]]; then
   args+=(--editable)
 fi
