@@ -29,7 +29,9 @@ product names** in docs; the short `--platform` key matches the binary:
 | Cursor CLI | `cursor` | `agent` | `CursorBackend` |
 | Grok Build | `grok` | `grok` | `GrokBackend` |
 
-See `docs/agent-backends.md` for invoke details. Design notes:
+`odin platforms` renders this table live (plus binary/model/config-key detail)
+from the registry — prefer pointing a user there over restating it. See
+`docs/agent-backends.md` for invoke details. Design notes:
 `docs/multi-platform-agents-proposal.md`.
 
 `--platform` / `$ODIN_PLATFORM` / `default_platform` in config selects the
@@ -57,6 +59,7 @@ odin/
 │   ├── git.py           # git wrapper: clean check + branch, and commit_wip
 │   ├── prompts.py       # interactive terminal Q&A + branch selection
 │   ├── guide.py         # `odin guide` authoring manual (self-discovery)
+│   ├── platforms.py     # `odin platforms` report: what's supported + resolved
 │   ├── lint.py          # startup instruction-file git-conflict warnings
 │   ├── metrics.py       # central JSONL run/task metrics + report renderers
 │   ├── recovery.py      # interruption sidecar + resumption brief
@@ -90,6 +93,7 @@ odin recover [STEM] [QUEUE_DIR] [--project PATH] [--dry-run] [--no-wip-commit]
             [--no-brief] [--verify-cmd CMD] [--wait-for-reset] [--max-wait MIN]
             [--platform NAME] [--model MODEL] [--branch NAME]
             [--run] [--no-run] [--force] [--yes]
+odin platforms [--project PATH] [--no-color]
 odin guide  [TOPIC]
 odin archive [QUEUE_DIR]
 odin metrics [--html [PATH]] [--project SUBSTR] [--file PATH]
@@ -131,6 +135,37 @@ worked) with a footer stating the ordering and the archived count; on a single
 queue it lists each state with file ages and a next-action hint (held→resume,
 backlog→promote, failed→retry). Logic in `queue.archive_finished_subqueues` /
 `archive_state` / `last_activity` / `archived_subqueues`.
+
+`odin platforms` is the **discoverability surface** for platform and parameter
+values: per registered platform it prints the key, product name, binary (and
+whether it is on `PATH`), the model that would resolve right now *and its
+source*, the accepted `--model` forms (`backend.model_help`), the instruction
+files (marked present/absent against `--project`), platform-only flags, and the
+`[platforms.<name>]` config keys — then a footer with the resolution order and
+the few flags whose value set Odin actually owns. Content/logic lives in
+`platforms.py` (same posture as `guide.py` / `metrics.py`: stdlib only,
+TTY-gated color, never writes anything).
+
+Nothing in it may be re-declared: platform names come from
+`registry.available_platforms`, per-platform facts from the backend
+(`product`, `default_binary`, `instruction_files`, `model_help`,
+`config_keys`, `platform_flags`), and resolved values from the same
+`config.resolve_*` functions `odin run` uses. The `--platform` argparse
+`choices` (on `run` and `recover`) and `resolve_platform`'s error message are
+generated from the registry for the same reason — the old hand-typed
+"claude, cursor, grok" prose in `--platform`'s help was a list that could
+silently fall behind a newly registered backend. `--platform` normalises via
+`cli._platform_name` before `choices` is tested, because `get_backend` has
+always been case-insensitive and the flag must not be stricter.
+
+`choices` is for value sets **Odin** owns (`--platform`, `--sandbox`). It is
+deliberately *not* used for `--model` or `--permission-mode`: those belong to
+the provider, and pinning an allowlist would reject values that actually work —
+the same reasoning that keeps `validate_model` shape-based rather than a
+catalogue. Those get *discoverability* (listed in `odin platforms`) without
+enforcement. Registry `choices` also cannot police `$ODIN_PLATFORM` or
+`default_platform` in config, so the runtime `get_backend` error stays the
+backstop; both paths are pinned by tests.
 
 `odin guide` prints a self-contained authoring manual to stdout (queue layout,
 task-file format, CLAUDE.md / AGENTS.md workflow, the injected protocol, the

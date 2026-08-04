@@ -34,6 +34,7 @@ class GrokBackend(AgentBackend):
     """Backend for xAI's Grok Build CLI (`grok`)."""
 
     name = "grok"
+    product = "Grok Build"
 
     def default_binary(self) -> str:
         return "grok"

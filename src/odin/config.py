@@ -104,9 +104,15 @@ def resolve_platform(
     default = config.get("default_platform")
     if isinstance(default, str) and default.strip():
         return default.strip().lower()
+    # Lazy import: backends depend on config (see cursor.build_invoke), so the
+    # registry is only pulled in on this error path to keep the layering intact.
+    from odin.backends.registry import available_platforms
+
+    known = ",".join(available_platforms())
     raise PlatformRequiredError(
-        "platform is required: pass --platform {claude,cursor,grok}, "
-        "set $ODIN_PLATFORM, or `odin config set default_platform …`"
+        f"platform is required: pass --platform {{{known}}}, "
+        "set $ODIN_PLATFORM, or `odin config set default_platform …` "
+        "(`odin platforms` shows what each one uses)"
     )
 
 

@@ -110,6 +110,19 @@ class CursorBackend(AgentBackend):
     """Backend for Cursor CLI (`agent`)."""
 
     name = "cursor"
+    product = "Cursor CLI"
+
+    def config_keys(self) -> list[str]:
+        # Two knobs beyond the common binary/model pair, both read in
+        # build_invoke below and both overridable by the matching CLI flag.
+        return [
+            *super().config_keys(),
+            f"platforms.{self.name}.sandbox",
+            f"platforms.{self.name}.approve_mcps",
+        ]
+
+    def platform_flags(self) -> list[str]:
+        return ["--force", "--trust", "--sandbox {enabled,disabled}", "--approve-mcps"]
 
     def default_binary(self) -> str:
         return "agent"

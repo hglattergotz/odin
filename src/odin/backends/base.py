@@ -156,6 +156,29 @@ class AgentBackend(ABC):
     #: Stable platform identifier — recorded in metrics and used by the registry.
     name: str = ""
 
+    #: Public product name, for help output and docs ("Claude Code" for
+    #: `claude`). Prefer this in anything a user reads; `name` is the key they
+    #: type. Falls back to `name` when a backend leaves it unset.
+    product: str = ""
+
+    def config_keys(self) -> list[str]:
+        """Dotted config keys this backend reads from `[platforms.<name>]`.
+
+        Every backend honours `binary` and `model`; a backend with extra knobs
+        (Cursor's sandbox / MCP approval) extends the list. Surfaced by
+        `odin platforms` so the config vocabulary is discoverable without
+        reading the source.
+        """
+        return [f"platforms.{self.name}.binary", f"platforms.{self.name}.model"]
+
+    def platform_flags(self) -> list[str]:
+        """`odin run` flags that apply *only* to this platform, for display.
+
+        Purely informational — the flags themselves are declared on the parser
+        and warned about in `cli._warn_ignored_platform_flags`.
+        """
+        return []
+
     @abstractmethod
     def default_binary(self) -> str:
         """The CLI binary name when the user passes no explicit override."""

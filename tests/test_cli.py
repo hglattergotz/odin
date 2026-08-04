@@ -259,7 +259,7 @@ def test_no_subcommand_prints_help_not_error(capsys):
     # The overview explains what the queue is and what the input looks like.
     assert "queue/<name>/pending/" in out
     assert "NNN-slug.md" in out
-    assert "{run,status,resume,recover,guide,archive,metrics,config}" in out
+    assert "{run,status,resume,recover,guide,platforms,archive,metrics,config}" in out
 
 
 def test_status_lists_each_section(setup, capsys):
@@ -579,21 +579,48 @@ def test_run_no_model_emits_no_model_flag(setup, tmp_path, monkeypatch):
     assert "--model" not in log.read_text().splitlines()
 
 
-def test_run_unknown_platform_errors_clearly(setup, capsys, monkeypatch):
-    """An unregistered `--platform` is a hard error before anything runs."""
+def test_run_unknown_platform_flag_rejected_at_parse_time(setup, capsys, monkeypatch):
+    """An unregistered `--platform` dies in argparse, listing the valid set.
+
+    Earlier than the registry error below on purpose: the flag's `choices` come
+    from the registry, so the user is told what *is* valid instead of only what
+    isn't, and nothing (git, queue, metrics) has been touched yet.
+    """
     monkeypatch.delenv("ODIN_PLATFORM", raising=False)
     project, qdir, fake = setup
     _seed_task(qdir, "001-a.md")
-    rc = _run_cli(
-        ["run", str(qdir), "--project", str(project),
-         "--platform", "kiro", "--claude-bin", str(fake)],
-        scenario="completed",
+    with pytest.raises(SystemExit) as excinfo:
+        _run_cli(
+            ["run", str(qdir), "--project", str(project),
+             "--platform", "kiro", "--claude-bin", str(fake)],
+            scenario="completed",
+        )
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid choice" in err
+    assert "kiro" in err
+    assert "claude" in err and "cursor" in err and "grok" in err
+    # Nothing ran — the task is untouched in pending/.
+    assert (qdir / "pending" / "001-a.md").exists()
+
+
+def test_run_unknown_platform_from_env_errors_clearly(setup, capsys, monkeypatch):
+    """`choices` can't police $ODIN_PLATFORM — the registry still must.
+
+    The env and config paths bypass argparse entirely, so the runtime
+    `get_backend` error stays the backstop for an unregistered name.
+    """
+    project, qdir, fake = setup
+    _seed_task(qdir, "001-a.md")
+    monkeypatch.setenv("ODIN_PLATFORM", "kiro")
+    rc = main(
+        ["run", str(qdir), "--project", str(project), "--claude-bin", str(fake)]
     )
     assert rc == 2
     err = capsys.readouterr().err
     assert "unknown platform" in err
     assert "kiro" in err
-    # Nothing ran — the task is untouched in pending/.
+    assert "claude, cursor, grok" in err
     assert (qdir / "pending" / "001-a.md").exists()
 
 

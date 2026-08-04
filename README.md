@@ -15,9 +15,19 @@ project, **one task at a time, each in a fresh session**. It carries context
 forward between tasks, runs the whole batch on a single branch, and stops
 cleanly to ask you a question when the agent hits a decision it should not
 guess. You choose the product with `--platform` (or `$ODIN_PLATFORM` /
-`default_platform` in config). There is no built-in default. See
-[`docs/agent-backends.md`](docs/agent-backends.md) for the product,
-`--platform`, and binary map.
+`default_platform` in config). There is no built-in default:
+
+| Product | `--platform` | Binary |
+|---------|--------------|--------|
+| [Claude Code](https://code.claude.com/docs) | `claude` | `claude` |
+| [Cursor CLI](https://cursor.com/docs/cli/overview) | `cursor` | `agent` |
+| [Grok Build](https://docs.x.ai/build/overview) | `grok` | `grok` |
+
+Run **`odin platforms`** for the live version of that table — plus, for each
+platform, whether its binary is actually on your `PATH`, which model would
+resolve right now and from where, the accepted `--model` forms, the
+instruction file it reads, and its config keys. Design notes:
+[`docs/agent-backends.md`](docs/agent-backends.md).
 
 It stays deliberately dumb: Odin owns *sequencing* and the small *protocol* it
 needs to read the agent's output. Your project's instruction file
@@ -251,11 +261,23 @@ entirely.
 ```sh
 odin -h          # all commands and flags
 odin run -h      # options for a subcommand
+odin platforms   # supported platforms, their binaries, models and config keys
 odin guide       # full task-authoring manual (queue layout, task files, protocol)
 ```
 
-Commands: `run`, `status`, `resume`, `recover`, `archive`, `metrics`, `guide`,
-`config`.
+Commands: `run`, `status`, `resume`, `recover`, `platforms`, `archive`,
+`metrics`, `guide`, `config`.
+
+Which values are valid where:
+
+- `--platform` is the one flag with a **closed set** — it is checked against
+  the backend registry, so a typo is refused up front and lists the valid
+  names. `--sandbox` is likewise `enabled|disabled`.
+- `--model` and `--permission-mode` are **passed through** to the agent CLI.
+  Odin only shape-checks a model name (to catch `opus-claude-5` for
+  `claude-opus-5`); it deliberately keeps no model catalogue, since a stale
+  allowlist would reject models that work. `odin platforms` prints the
+  accepted forms and current suggestions per platform.
 
 `odin guide` prints the full authoring manual. It is exactly what your agent
 reads in [Quickest start](#quickest-start-let-your-agent-set-it-up). Topics
