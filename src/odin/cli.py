@@ -19,7 +19,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import TextIO
 
-from . import __version__, completed, config, git, metrics, recovery, style, term, wait
+from . import (
+    __version__, completed, config, git, metrics, platforms as platforms_report,
+    recovery, style, term, wait,
+)
 from .backends.base import AgentBackend, Failure, FailureKind
 from .backends.registry import available_platforms, get_backend
 from .contract import build_system_prompt
@@ -62,6 +65,7 @@ Odin runs a queue of tasks through Claude Code (`claude`), Cursor CLI
 carrying context forward between tasks and pausing when the agent needs your
 input. Pick the product with --platform (or $ODIN_PLATFORM, or
 `odin config set default_platform <name>`); there is no built-in default.
+Run `odin platforms` to see the supported platforms and what each would use.
 
 The queue
   Organize tasks into NAMED queues under ./queue — one sub-queue per batch of
@@ -113,10 +117,22 @@ common commands:
   odin archive                        # finished sub-queues out of the overview
   odin metrics                        # usage and cost across every project
 
+  odin platforms                      # which platforms/models/binaries are usable
+
 Run `odin run -h` for the full set of run options.
 Run `odin guide` for a complete task-authoring manual (an agent can read it
 to learn the format with no other context).
 """
+
+
+def _platform_name(raw: str) -> str:
+    """argparse `type` for `--platform`: normalise before `choices` is checked.
+
+    The registry resolves case-insensitively, so `--platform CLAUDE` has always
+    worked; `choices` is an exact-match test, so the normalisation has to happen
+    here or the flag would get stricter than `get_backend`.
+    """
+    return raw.strip().lower()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -135,7 +151,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(
         dest="cmd",
-        metavar="{run,status,resume,recover,guide,archive,metrics,config}",
+        metavar="{run,status,resume,recover,guide,platforms,archive,metrics,config}",
     )
 
     run = sub.add_parser(
@@ -207,10 +223,10 @@ def _build_parser() -> argparse.ArgumentParser:
              "claude.",
     )
     run.add_argument(
-        "--sandbox", default=None, metavar="MODE",
-        help="(cursor) sandbox mode passed as --sandbox (enabled|disabled); "
-             "overrides platforms.cursor.sandbox in config. Ignored (with a "
-             "warning) on claude.",
+        "--sandbox", default=None, choices=platforms_report.SANDBOX_MODES,
+        help="(cursor) sandbox mode passed as --sandbox; overrides "
+             "platforms.cursor.sandbox in config. Ignored (with a warning) on "
+             "claude.",
     )
     run.add_argument(
         "--approve-mcps", action="store_true", default=None,
@@ -220,15 +236,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--platform", default=None,
+        # Choices come from the registry so adding a backend updates --help
+        # (and the error on a typo) with no second list to maintain.
+        type=_platform_name, choices=available_platforms(),
         help="required unless $ODIN_PLATFORM or default_platform in config is "
-             "set: claude (Claude Code), cursor (Cursor CLI), grok (Grok Build). "
-             "No built-in product default. See docs/agent-backends.md.",
+             "set. No built-in product default. `odin platforms` shows each "
+             "one's binary, model and config keys.",
     )
     run.add_argument(
         "--model", default=None,
         help="model passed to the agent CLI as --model (resolution: this flag → "
              "$ODIN_MODEL → platforms.<platform>.model in config → unset). "
-             "Unset emits no --model, i.e. the platform CLI's own default.",
+             "Unset emits no --model, i.e. the platform CLI's own default. "
+             "Free text — `odin platforms` lists the accepted forms per platform.",
     )
     run.add_argument(
         "--branch", default=None,
@@ -400,8 +420,9 @@ def _build_parser() -> argparse.ArgumentParser:
     # which platform/model/branch that run uses — otherwise the continuation
     # silently falls back to config and env.
     rc.add_argument(
-        "--platform", default=None, metavar="NAME",
-        help="agent platform for the continuation run (claude, cursor, grok)",
+        "--platform", default=None,
+        type=_platform_name, choices=available_platforms(),
+        help="agent platform for the continuation run (`odin platforms` lists them)",
     )
     rc.add_argument(
         "--model", default=None,
@@ -444,6 +465,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="all (default), or a focused topic: " + ", ".join(TOPICS),
     )
     gd.set_defaults(func=_cmd_guide)
+
+    pl = sub.add_parser(
+        "platforms",
+        help="list the supported agent platforms and what each would use",
+        description=(
+            "Show every platform Odin can drive (the valid --platform values) "
+            "and, for each, the binary it runs and whether that binary is on "
+            "PATH, the model that would resolve right now, the accepted --model "
+            "forms, the project instruction file it reads, and its config keys. "
+            "Everything is derived from the backend registry and the same "
+            "resolution used by `odin run`, so it can't drift."
+        ),
+    )
+    pl.add_argument(
+        "--project", default=None, type=Path,
+        help="project to check instruction files against (default: cwd)",
+    )
+    pl.add_argument(
+        "--no-color", action="store_true",
+        help="never emit ANSI color (also honours NO_COLOR / ODIN_NO_COLOR)",
+    )
+    pl.set_defaults(func=_cmd_platforms)
 
     ar = sub.add_parser(
         "archive",
@@ -2150,6 +2193,18 @@ def _continue_after_recovery(q: Queue, args: argparse.Namespace) -> int:
 
 def _cmd_guide(args: argparse.Namespace) -> int:
     print(render_guide(args.topic), end="")
+    return 0
+
+
+# ----------------------------------------------------------------------
+# platforms
+# ----------------------------------------------------------------------
+
+def _cmd_platforms(args: argparse.Namespace) -> int:
+    if args.no_color:
+        style.set_no_color(True)
+    project = (args.project or Path.cwd()).resolve()
+    print(platforms_report.render(project=project, out=sys.stdout))
     return 0
 
 

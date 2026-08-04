@@ -18,6 +18,11 @@ The short `--platform` key matches the usual binary name (`claude` / `cursor` /
 `grok`). In docs and UI copy, prefer the **public product name** so readers
 know which tool is supported.
 
+`odin platforms` prints this table from the registry at runtime, plus what each
+platform would actually use right now (binary and whether it is on `PATH`,
+resolved model and its source, accepted `--model` forms, instruction files,
+config keys). Send users there rather than to a copy of the table.
+
 **Not the same thing:** running Cursor CLI with a Grok *model*
 (`--platform cursor --model cursor-grok-4.5-high`) is still Cursor CLI.
 `--platform grok` means the **Grok Build** product (`grok` on PATH).
@@ -36,7 +41,10 @@ odin config set default_platform cursor   # persist so --platform can be omitted
 ```
 
 Resolution: **`--platform` → `$ODIN_PLATFORM` → `default_platform` in
-`~/.odin/config.toml` → error if unset**. Unknown names fail via the registry
+`~/.odin/config.toml` → error if unset**. The flag's argparse `choices` are
+generated from the registry, so an unknown `--platform` is refused at parse
+time and the message lists the valid names; unknown values arriving via env or
+config bypass argparse and fail on the registry error instead
 (`available platforms: claude, cursor, grok`).
 
 Binary override (any platform): **`--agent-bin`** → config
@@ -60,6 +68,12 @@ when you only set a model.
 
 Each backend supplies `build_invoke`, `handle_stream_event`, `normalise_result`,
 `default_binary`, and `instruction_files`.
+
+It also carries the metadata `odin platforms` renders, so the report never
+re-declares a platform fact: `product` (public name), `config_keys()` (defaults
+to `platforms.<name>.binary` + `.model`; Cursor adds `sandbox` /
+`approve_mcps`), `platform_flags()` (flags that apply only to it), and the
+optional `model_help()` / `validate_model()` pair.
 
 ## Claude Code (`--platform claude`)
 
@@ -113,8 +127,11 @@ grok --output-format streaming-json --permission-mode <mode> \
 
 ## Adding another backend (Kiro, Codex, …)
 
-1. Implement `AgentBackend` in `src/odin/backends/<name>.py`
-2. Register it in `registry._BACKENDS`
+1. Implement `AgentBackend` in `src/odin/backends/<name>.py`, including
+   `product` (and `config_keys` / `platform_flags` if it has extra knobs) so
+   `odin platforms` describes it correctly
+2. Register it in `registry._BACKENDS` — this alone adds it to `--platform`'s
+   accepted values, its help text, and the `odin platforms` report
 3. Choose `prompt_via` (`stdin` or `file`) and mark terminal / text deltas in
    `handle_stream_event`
 4. Put success / usage / cost logic in `normalise_result`

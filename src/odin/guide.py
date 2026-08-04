@@ -26,9 +26,10 @@ run one at a time, each in a fresh session, with context carried forward
 and pauses for input. Your job as the author is to produce two things: a
 **queue of task files** and (optionally) a **project instruction file** with
 your workflow rules (`CLAUDE.md` for Claude Code / Grok Build, `AGENTS.md` /
-`.cursor/rules` for Cursor CLI). See `odin guide agent-md` and
-`docs/agent-backends.md` for the product ↔ platform map. This guide is
-everything you need to do that.
+`.cursor/rules` for Cursor CLI). Run `odin platforms` for the live product ↔
+platform map — which platforms this install supports, whether each one's
+binary is on PATH, and which model it would use — or see `odin guide agent-md`
+and `docs/agent-backends.md`. This guide is everything you need to do that.
 """
 
 _QUEUE = """\
@@ -409,6 +410,9 @@ _RUN = """\
 
     mkdir -p queue/<name>/pending      # one named sub-queue per batch of work
     # write your NNN-slug.md task files into queue/<name>/pending/
+
+    odin platforms                     # which --platform values work here, and
+                                       #   what each would use (binary, model)
 
     # Claude Code — needs `claude` on PATH
     odin run <name> --platform claude --branch <name>

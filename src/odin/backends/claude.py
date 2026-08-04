@@ -199,6 +199,7 @@ class ClaudeBackend(AgentBackend):
     """Backend for Anthropic's Claude Code CLI (`claude`)."""
 
     name = "claude"
+    product = "Claude Code"
 
     def default_binary(self) -> str:
         return "claude"
